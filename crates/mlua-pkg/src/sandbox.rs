@@ -191,6 +191,13 @@ impl SandboxedFs for FsSandbox {
 /// - **No `canonicalize()` step**: The directory capability itself defines
 ///   the sandbox boundary.
 ///
+/// # Symlink behavior
+///
+/// Symlinks that resolve outside the sandbox are always blocked.
+/// Handling of symlinks within the sandbox is platform-dependent
+/// (Linux `RESOLVE_BENEATH` follows them; other platforms may not).
+/// For portable behavior, avoid symlinks inside sandbox directories.
+///
 /// # Behavioral differences from [`FsSandbox`]
 ///
 /// | Aspect | `FsSandbox` | `CapSandbox` |
@@ -233,18 +240,18 @@ impl CapSandbox {
     /// handle. All subsequent reads are confined to this directory by the OS.
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, InitError> {
         let raw = root.into();
-        let dir = cap_std::fs::Dir::open_ambient_dir(&raw, cap_std::ambient_authority()).map_err(
-            |e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    InitError::RootNotFound { path: raw.clone() }
-                } else {
-                    InitError::Io {
-                        path: raw.clone(),
-                        source: e,
-                    }
-                }
-            },
-        )?;
+        let dir = match cap_std::fs::Dir::open_ambient_dir(&raw, cap_std::ambient_authority()) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(InitError::RootNotFound { path: raw });
+            }
+            Err(e) => {
+                return Err(InitError::Io {
+                    path: raw,
+                    source: e,
+                });
+            }
+        };
         Ok(Self { dir })
     }
 }
