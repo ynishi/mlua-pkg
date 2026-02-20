@@ -12,28 +12,30 @@ under a single `Resolver` trait.
 use mlua::Lua;
 use mlua_pkg::{Registry, resolvers::*};
 
-let lua = Lua::new();
-let mut reg = Registry::new();
+fn setup(lua: &Lua) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reg = Registry::new();
 
-// Rust-native module (highest priority)
-reg.add(NativeResolver::new().add("@std/http", |lua| {
-    let t = lua.create_table()?;
-    t.set("version", 1)?;
-    Ok(mlua::Value::Table(t))
-}));
+    // Rust-native module (highest priority)
+    reg.add(NativeResolver::new().add("@std/http", |lua| {
+        let t = lua.create_table()?;
+        t.set("version", 1)?;
+        Ok(mlua::Value::Table(t))
+    }));
 
-// Embedded Lua source
-reg.add(MemoryResolver::new().add("utils", "return { pi = 3.14 }"));
+    // Embedded Lua source
+    reg.add(MemoryResolver::new().add("utils", "return { pi = 3.14 }"));
 
-// Filesystem with sandbox (dot-separated -> path)
-// reg.add(FsResolver::new("./scripts")?);
+    // Filesystem with sandbox (dot-separated -> path)
+    reg.add(FsResolver::new("./scripts")?);
 
-// Non-Lua assets with pluggable parsers
-// reg.add(AssetResolver::new("./assets")?
-//     .parser("json", json_parser())
-//     .parser("sql", text_parser()));
+    // Non-Lua assets with pluggable parsers
+    reg.add(AssetResolver::new("./assets")?
+        .parser("json", json_parser())
+        .parser("sql", text_parser()));
 
-reg.install(&lua).unwrap();
+    reg.install(lua)?;
+    Ok(())
+}
 
 // Lua side: require("@std/http"), require("utils"), etc.
 ```
@@ -145,14 +147,33 @@ reg.add(FsResolver::new("./scripts")?);
 
 ## Sandbox
 
-All filesystem access goes through `SandboxedFs` trait.
-The default `FsSandbox` implementation canonicalizes paths and blocks traversal.
+All filesystem access goes through the `SandboxedFs` trait.
+Two implementations are provided:
+
+| Implementation | TOCTOU safe | Dependency |
+|---------------|-------------|------------|
+| `FsSandbox` (default) | No | None |
+| `CapSandbox` | Yes | `cap-std` (opt-in) |
+
+`FsSandbox` canonicalizes paths and blocks traversal, but has a TOCTOU gap
+between `canonicalize()` and `read_to_string()`.
+
+`CapSandbox` eliminates the TOCTOU gap via OS-level capability-based file
+access (`openat2` / `RESOLVE_BENEATH` on Linux, equivalent on other platforms).
+
+```toml
+# Enable CapSandbox
+mlua-pkg = { version = "0.1", features = ["sandbox-cap-std"] }
+```
+
+```rust
+use mlua_pkg::{resolvers::FsResolver, sandbox::CapSandbox};
+
+let resolver = FsResolver::with_sandbox(CapSandbox::new("./scripts")?);
+```
 
 For test mocking, implement `SandboxedFs` on your own type
 and inject it via `FsResolver::with_sandbox()` / `AssetResolver::with_sandbox()`.
-
-**Known limitation**: TOCTOU gap between `canonicalize()` and `read_to_string()`.
-For adversarial environments, swap in a `cap-std` based implementation.
 
 ## License
 

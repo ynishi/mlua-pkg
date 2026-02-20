@@ -15,7 +15,7 @@
 //!       |
 //!   +---+---+
 //!   |       |
-//! FsSandbox  MockSandbox (for testing)
+//! FsSandbox  CapSandbox (cap-std)  MockSandbox (for testing)
 //! ```
 //!
 //! Rationale for using `Box<dyn SandboxedFs>` (dynamic dispatch):
@@ -115,8 +115,9 @@ pub trait SandboxedFs: Send + Sync {
 /// ## Known limitations
 ///
 /// - **TOCTOU**: Vulnerable to symlink swap attacks between `canonicalize()`
-///   and `read_to_string()`. For adversarial inputs, use the `cap-std` crate.
-///   The [`SandboxedFs`] trait makes backend replacement straightforward.
+///   and `read_to_string()`. For adversarial inputs, use [`CapSandbox`]
+///   (requires the `sandbox-cap-std` feature) which eliminates the gap via
+///   OS-level capability-based file access.
 ///
 /// - **Windows device names**: No defense against reserved device names like
 ///   `NUL`, `CON`, `PRN`, etc. Risk of DoS/hang on Windows.
@@ -168,6 +169,97 @@ impl SandboxedFs for FsSandbox {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(ReadError::Io {
                 path: canonical,
+                source: e,
+            }),
+        }
+    }
+}
+
+// -- CapSandbox --
+
+/// Capability-based sandbox using [`cap_std`].
+///
+/// Eliminates the TOCTOU gap present in [`FsSandbox`] by using OS-level
+/// capability-based file access (`openat2` / `RESOLVE_BENEATH` on Linux,
+/// equivalent mechanisms on other platforms).
+///
+/// # Security properties
+///
+/// - **No TOCTOU gap**: Path resolution and file open happen atomically
+///   within the OS kernel (on supported platforms).
+/// - **Symlink escape prevention**: Handled by the OS, not userspace checks.
+/// - **No `canonicalize()` step**: The directory capability itself defines
+///   the sandbox boundary.
+///
+/// # Behavioral differences from [`FsSandbox`]
+///
+/// | Aspect | `FsSandbox` | `CapSandbox` |
+/// |--------|-------------|--------------|
+/// | Traversal error | `ReadError::Traversal` | `ReadError::Io` (OS-level denial) |
+/// | `resolved_path` | Absolute canonical path | Relative path as given |
+/// | TOCTOU | Vulnerable | Eliminated |
+///
+/// Traversal attempts are blocked by the OS before reaching userspace.
+/// The returned `ReadError::Io` will carry the platform-specific error
+/// (e.g. `EXDEV`, `EACCES`).
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use mlua_pkg::{resolvers::FsResolver, sandbox::CapSandbox};
+///
+/// let sandbox = CapSandbox::new("./scripts")?;
+/// let resolver = FsResolver::with_sandbox(sandbox);
+/// # Ok::<(), mlua_pkg::sandbox::InitError>(())
+/// ```
+///
+/// # Availability
+///
+/// Requires the `sandbox-cap-std` feature:
+///
+/// ```toml
+/// mlua-pkg = { version = "0.1", features = ["sandbox-cap-std"] }
+/// ```
+#[cfg(feature = "sandbox-cap-std")]
+pub struct CapSandbox {
+    dir: cap_std::fs::Dir,
+}
+
+#[cfg(feature = "sandbox-cap-std")]
+impl CapSandbox {
+    /// Open a directory as a capability-based sandbox.
+    ///
+    /// Uses [`cap_std::fs::Dir::open_ambient_dir`] to obtain a directory
+    /// handle. All subsequent reads are confined to this directory by the OS.
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, InitError> {
+        let raw = root.into();
+        let dir = cap_std::fs::Dir::open_ambient_dir(&raw, cap_std::ambient_authority()).map_err(
+            |e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    InitError::RootNotFound { path: raw.clone() }
+                } else {
+                    InitError::Io {
+                        path: raw.clone(),
+                        source: e,
+                    }
+                }
+            },
+        )?;
+        Ok(Self { dir })
+    }
+}
+
+#[cfg(feature = "sandbox-cap-std")]
+impl SandboxedFs for CapSandbox {
+    fn read(&self, relative: &Path) -> Result<Option<FileContent>, ReadError> {
+        match self.dir.read_to_string(relative) {
+            Ok(content) => Ok(Some(FileContent {
+                content,
+                resolved_path: relative.to_path_buf(),
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(ReadError::Io {
+                path: relative.to_path_buf(),
                 source: e,
             }),
         }

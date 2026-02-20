@@ -1,6 +1,8 @@
 use mlua::{Lua, Result, Value};
 use mlua_pkg::Registry;
 use mlua_pkg::resolvers::*;
+#[cfg(feature = "sandbox-cap-std")]
+use mlua_pkg::sandbox::CapSandbox;
 use mlua_pkg::sandbox::InitError;
 use std::io::Write;
 
@@ -451,4 +453,119 @@ fn prefix_with_native_and_fs() {
 
     let url: String = lua.load(r#"return require("plugin").url"#).eval().unwrap();
     assert_eq!(url, "https://example.com/api/v1");
+}
+
+// -- 16. CapSandbox: capability-based sandboxed read --
+
+#[cfg(feature = "sandbox-cap-std")]
+#[test]
+fn cap_sandbox_reads_file() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let lib_dir = dir.path().join("lib");
+    std::fs::create_dir_all(&lib_dir).unwrap();
+    std::fs::write(lib_dir.join("helper.lua"), "return { name = 'cap' }").unwrap();
+
+    let pkg_dir = dir.path().join("mypkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(pkg_dir.join("init.lua"), "return { name = 'cap-init' }").unwrap();
+
+    let lua = Lua::new();
+    let mut reg = Registry::new();
+    reg.add(FsResolver::with_sandbox(
+        CapSandbox::new(dir.path()).unwrap(),
+    ));
+    reg.install(&lua).unwrap();
+
+    let v: String = lua
+        .load(r#"return require("lib.helper").name"#)
+        .eval()
+        .unwrap();
+    assert_eq!(v, "cap");
+
+    let v: String = lua.load(r#"return require("mypkg").name"#).eval().unwrap();
+    assert_eq!(v, "cap-init");
+}
+
+// -- 17. CapSandbox: file not found returns None (falls through) --
+
+#[cfg(feature = "sandbox-cap-std")]
+#[test]
+fn cap_sandbox_miss_falls_through() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let lua = Lua::new();
+    let mut reg = Registry::new();
+    reg.add(FsResolver::with_sandbox(
+        CapSandbox::new(dir.path()).unwrap(),
+    ));
+    reg.add(MemoryResolver::new().add("fallback", "return 'from memory'"));
+    reg.install(&lua).unwrap();
+
+    let v: String = lua.load(r#"return require("fallback")"#).eval().unwrap();
+    assert_eq!(v, "from memory");
+}
+
+// -- 18. CapSandbox: path traversal blocked by OS --
+
+#[cfg(all(feature = "sandbox-cap-std", unix))]
+#[test]
+fn cap_sandbox_blocks_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let outside = dir.path().join("secret.lua");
+    std::fs::write(&outside, "return 'escaped'").unwrap();
+
+    let sandbox = dir.path().join("sandbox");
+    std::fs::create_dir_all(&sandbox).unwrap();
+
+    // Symlink pointing outside the sandbox
+    std::os::unix::fs::symlink(&outside, sandbox.join("escape.lua")).unwrap();
+
+    let lua = Lua::new();
+    let mut reg = Registry::new();
+    reg.add(FsResolver::with_sandbox(CapSandbox::new(&sandbox).unwrap()));
+    reg.install(&lua).unwrap();
+
+    // Symlink escape should be blocked by cap-std
+    let result: Result<Value> = lua.load(r#"return require("escape")"#).eval();
+    assert!(result.is_err());
+}
+
+// -- 19. CapSandbox: rejects nonexistent root --
+
+#[cfg(feature = "sandbox-cap-std")]
+#[test]
+fn cap_sandbox_rejects_nonexistent_root() {
+    let result = CapSandbox::new("/nonexistent/path/that/does/not/exist");
+    let Err(err) = result else {
+        panic!("expected RootNotFound error");
+    };
+    assert!(
+        matches!(err, InitError::RootNotFound { .. }),
+        "expected RootNotFound, got: {err}"
+    );
+}
+
+// -- 20. CapSandbox: AssetResolver integration --
+
+#[cfg(feature = "sandbox-cap-std")]
+#[test]
+fn cap_sandbox_asset_json() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("data.json"), r#"{"key": "value"}"#).unwrap();
+
+    let lua = Lua::new();
+    let mut reg = Registry::new();
+    reg.add(
+        AssetResolver::with_sandbox(CapSandbox::new(dir.path()).unwrap())
+            .parser("json", json_parser()),
+    );
+    reg.install(&lua).unwrap();
+
+    let v: String = lua
+        .load(r#"return require("data.json").key"#)
+        .eval()
+        .unwrap();
+    assert_eq!(v, "value");
 }

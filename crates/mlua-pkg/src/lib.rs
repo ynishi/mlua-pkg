@@ -103,6 +103,7 @@
 //! use mlua_pkg::{Registry, resolvers::*};
 //! use mlua::Lua;
 //!
+//! # fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! let lua = Lua::new();
 //! let mut reg = Registry::new();
 //!
@@ -117,16 +118,24 @@
 //! reg.add(MemoryResolver::new().add("utils", "return { pi = 3.14 }"));
 //!
 //! // 3rd: Filesystem (sandboxed)
-//! // reg.add(FsResolver::new("./plugins")?);
+//! # let plugins = std::env::temp_dir().join("mlua_pkg_doctest_plugins");
+//! # std::fs::create_dir_all(&plugins)?;
+//! # let assets = std::env::temp_dir().join("mlua_pkg_doctest_assets");
+//! # std::fs::create_dir_all(&assets)?;
+//! reg.add(FsResolver::new(&plugins)?);
 //!
 //! // 4th: Assets (register parsers explicitly)
-//! // reg.add(AssetResolver::new("./assets")?
-//! //     .parser("json", json_parser())
-//! //     .parser("sql", text_parser()));
+//! reg.add(AssetResolver::new(&assets)?
+//!     .parser("json", json_parser())
+//!     .parser("sql", text_parser()));
+//! # std::fs::remove_dir_all(&plugins).ok();
+//! # std::fs::remove_dir_all(&assets).ok();
 //!
-//! reg.install(&lua).unwrap();
+//! reg.install(&lua)?;
 //!
 //! // Lua side: require("@std/http"), require("utils"), etc.
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! # Lua integration
@@ -290,6 +299,23 @@ pub trait Resolver: Send + Sync {
 /// - If the searcher returns a `string`, it is collected as a "not found" reason in the error message
 ///
 /// The loader receives `(name, loader_data)` (per Lua 5.4 spec).
+///
+/// # Thread safety
+///
+/// `Registry` itself is `Send + Sync` (all Resolvers must be `Send + Sync`).
+/// After [`install()`](Registry::install), the Registry is wrapped in `Arc` and
+/// shared via a Lua closure.
+///
+/// Thread safety of the installed hook depends on the `mlua` feature configuration:
+///
+/// | mlua feature | `Lua` bounds | Implication |
+/// |-------------|-------------|-------------|
+/// | (default) | `!Send` | `Lua` is confined to one thread. The hook is never called concurrently. |
+/// | `send` | `Send + Sync` | `Lua` can be shared across threads. `Resolver: Send + Sync` ensures safe concurrent access. |
+///
+/// The `Send + Sync` bound on [`Resolver`] is required for forward compatibility
+/// with mlua's `send` feature. Without the `send` feature, `Lua` is `!Send` and
+/// the hook is inherently single-threaded.
 pub struct Registry {
     resolvers: Vec<Box<dyn Resolver>>,
 }
