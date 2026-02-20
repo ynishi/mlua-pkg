@@ -10,6 +10,7 @@ readme = "../../README.md"
 keywords = ["lua", "mlua", "require", "module", "loader"]
 categories = ["game-development", "config"]
 rust-version = "1.85"
+include = ["src/**/*", "tests/**/*", "LICENSE-*"]
 
 [features]
 sandbox-cap-std = ["dep:cap-std"]
