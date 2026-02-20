@@ -1,0 +1,20 @@
+[package]
+name = "mlua-pkg"
+version = "0.1.0"
+edition = "2024"
+authors = ["Yutaka Nishimura"]
+description = "Composable Lua module loader for mlua"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ynishi/mlua-pkg"
+readme = "../../README.md"
+keywords = ["lua", "mlua", "require", "module", "loader"]
+categories = ["game-development", "config"]
+rust-version = "1.85"
+
+[dependencies]
+mlua = { version = "0.10", features = ["lua54", "vendored", "serialize"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
