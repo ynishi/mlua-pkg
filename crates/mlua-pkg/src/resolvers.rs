@@ -466,8 +466,7 @@ impl Resolver for AssetResolver {
 /// // require("game")        -> MemoryResolver("game")
 /// ```
 pub struct PrefixResolver {
-    prefix: String,
-    separator: char,
+    prefix_with_sep: String,
     inner: Box<dyn Resolver>,
 }
 
@@ -476,33 +475,39 @@ impl PrefixResolver {
     ///
     /// `require("{prefix}.{rest}")` -> `inner.resolve("{rest}")`
     pub fn new(prefix: impl Into<String>, inner: impl Resolver + 'static) -> Self {
+        let prefix = prefix.into();
+        let sep = crate::LuaConvention::default().module_separator;
+        let mut prefix_with_sep = String::with_capacity(prefix.len() + sep.len_utf8());
+        prefix_with_sep.push_str(&prefix);
+        prefix_with_sep.push(sep);
         Self {
-            prefix: prefix.into(),
-            separator: crate::LuaConvention::default().module_separator,
+            prefix_with_sep,
             inner: Box::new(inner),
         }
     }
 
     /// Apply a [`LuaConvention`](crate::LuaConvention) in bulk.
     pub fn with_convention(mut self, conv: crate::LuaConvention) -> Self {
-        self.separator = conv.module_separator;
+        self.replace_separator(conv.module_separator);
         self
     }
 
     /// Change the separator (default: `.`).
     pub fn with_separator(mut self, separator: char) -> Self {
-        self.separator = separator;
+        self.replace_separator(separator);
         self
+    }
+
+    fn replace_separator(&mut self, new_sep: char) {
+        let old_sep_len = self.prefix_with_sep.chars().last().map_or(0, char::len_utf8);
+        self.prefix_with_sep.truncate(self.prefix_with_sep.len() - old_sep_len);
+        self.prefix_with_sep.push(new_sep);
     }
 }
 
 impl Resolver for PrefixResolver {
     fn resolve(&self, lua: &Lua, name: &str) -> Option<Result<Value>> {
-        let mut prefix_with_sep = String::with_capacity(self.prefix.len() + 1);
-        prefix_with_sep.push_str(&self.prefix);
-        prefix_with_sep.push(self.separator);
-
-        let rest = name.strip_prefix(&prefix_with_sep)?;
+        let rest = name.strip_prefix(&self.prefix_with_sep)?;
         self.inner.resolve(lua, rest)
     }
 }
