@@ -1,7 +1,7 @@
 [package]
 name = "mlua-pkg"
 version = "0.2.0"
-edition = "2024"
+edition = "2021"
 authors = ["Yutaka Nishimura"]
 description = "Composable Lua module loader for mlua"
 license = "MIT OR Apache-2.0"

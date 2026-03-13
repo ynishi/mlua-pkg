@@ -1,9 +1,9 @@
 use mlua::{Lua, Result, Value};
-use mlua_pkg::Registry;
 use mlua_pkg::resolvers::*;
 #[cfg(feature = "sandbox-cap-std")]
 use mlua_pkg::sandbox::CapSandbox;
 use mlua_pkg::sandbox::InitError;
+use mlua_pkg::Registry;
 use std::io::Write;
 
 // -- 1. preload: require in-memory Lua sources --
