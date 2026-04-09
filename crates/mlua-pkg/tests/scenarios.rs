@@ -2,7 +2,7 @@ use mlua::{Lua, Result, Value};
 use mlua_pkg::resolvers::*;
 #[cfg(feature = "sandbox-cap-std")]
 use mlua_pkg::sandbox::CapSandbox;
-use mlua_pkg::sandbox::InitError;
+use mlua_pkg::sandbox::{InitError, SymlinkAwareSandbox};
 use mlua_pkg::Registry;
 use std::io::Write;
 
@@ -568,4 +568,124 @@ fn cap_sandbox_asset_json() {
         .eval()
         .unwrap();
     assert_eq!(v, "value");
+}
+
+// -- 21. SymlinkAwareSandbox: follows symlinks in root --
+
+#[cfg(unix)]
+#[test]
+fn symlink_aware_sandbox_follows_root_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // External package directory (simulates agent-profiles/packages/my_pkg)
+    let external = dir.path().join("external_pkg");
+    std::fs::create_dir_all(&external).unwrap();
+    std::fs::write(external.join("init.lua"), "return { linked = true }").unwrap();
+
+    // Sandbox root (simulates ~/.algocline/packages/)
+    let sandbox = dir.path().join("sandbox");
+    std::fs::create_dir_all(&sandbox).unwrap();
+
+    // Symlink: sandbox/my_pkg -> external_pkg (like alc_pkg_link)
+    std::os::unix::fs::symlink(&external, sandbox.join("my_pkg")).unwrap();
+
+    let lua = Lua::new();
+    let mut reg = Registry::new();
+    reg.add(FsResolver::with_sandbox(
+        SymlinkAwareSandbox::new(&sandbox).unwrap(),
+    ));
+    reg.install(&lua).unwrap();
+
+    let v: bool = lua
+        .load(r#"return require("my_pkg").linked"#)
+        .eval()
+        .unwrap();
+    assert!(v);
+}
+
+// -- 22. SymlinkAwareSandbox: blocks traversal outside symlink targets --
+
+#[cfg(unix)]
+#[test]
+fn symlink_aware_sandbox_blocks_non_target_traversal() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Secret file outside sandbox, NOT a symlink target
+    let secret = dir.path().join("secret.lua");
+    std::fs::write(&secret, "return 'escaped'").unwrap();
+
+    let sandbox = dir.path().join("sandbox");
+    std::fs::create_dir_all(&sandbox).unwrap();
+
+    // Symlink directly to a file outside (not a directory in root)
+    std::os::unix::fs::symlink(&secret, sandbox.join("escape.lua")).unwrap();
+
+    let lua = Lua::new();
+    let mut reg = Registry::new();
+    reg.add(FsResolver::with_sandbox(
+        SymlinkAwareSandbox::new(&sandbox).unwrap(),
+    ));
+    reg.install(&lua).unwrap();
+
+    // ../secret should be blocked
+    let result: Result<Value> = lua.load(r#"return require("..secret")"#).eval();
+    assert!(result.is_err());
+}
+
+// -- 23. SymlinkAwareSandbox: non-symlink files work normally --
+
+#[cfg(unix)]
+#[test]
+fn symlink_aware_sandbox_normal_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let sandbox = dir.path().join("sandbox");
+    std::fs::create_dir_all(sandbox.join("real_pkg")).unwrap();
+    std::fs::write(
+        sandbox.join("real_pkg").join("init.lua"),
+        "return { real = true }",
+    )
+    .unwrap();
+
+    let lua = Lua::new();
+    let mut reg = Registry::new();
+    reg.add(FsResolver::with_sandbox(
+        SymlinkAwareSandbox::new(&sandbox).unwrap(),
+    ));
+    reg.install(&lua).unwrap();
+
+    let v: bool = lua
+        .load(r#"return require("real_pkg").real"#)
+        .eval()
+        .unwrap();
+    assert!(v);
+}
+
+// -- 24. SymlinkAwareSandbox: submodules within symlinked package --
+
+#[cfg(unix)]
+#[test]
+fn symlink_aware_sandbox_submodule_in_linked_pkg() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let external = dir.path().join("ext_pkg");
+    std::fs::create_dir_all(external.join("sub")).unwrap();
+    std::fs::write(external.join("init.lua"), "return { root = true }").unwrap();
+    std::fs::write(external.join("sub").join("init.lua"), "return { sub = true }").unwrap();
+
+    let sandbox = dir.path().join("sandbox");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::os::unix::fs::symlink(&external, sandbox.join("ext_pkg")).unwrap();
+
+    let lua = Lua::new();
+    let mut reg = Registry::new();
+    reg.add(FsResolver::with_sandbox(
+        SymlinkAwareSandbox::new(&sandbox).unwrap(),
+    ));
+    reg.install(&lua).unwrap();
+
+    let v: bool = lua
+        .load(r#"return require("ext_pkg.sub").sub"#)
+        .eval()
+        .unwrap();
+    assert!(v);
 }

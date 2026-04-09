@@ -175,6 +175,115 @@ impl SandboxedFs for FsSandbox {
     }
 }
 
+// -- SymlinkAwareSandbox --
+
+/// Sandbox that follows symlinks in the root directory.
+///
+/// Like [`FsSandbox`], but also allows access to targets of symlinks
+/// found directly under the root. This is designed for package managers
+/// (e.g. `npm link` / `alc_pkg_link`) where the root directory contains
+/// symlinks pointing to external source directories.
+///
+/// # How it works
+///
+/// At construction time, scans the root for symlink entries and records
+/// their canonical targets as additional allowed roots. During `read()`,
+/// a file is permitted if its canonical path is under the root **or**
+/// under any of the recorded symlink targets.
+///
+/// # Security boundary
+///
+/// Same as [`FsSandbox`]: casual escape prevention for trusted directories.
+/// The allowed target set is fixed at construction time; symlinks added
+/// after construction are not recognized until a new instance is created.
+pub struct SymlinkAwareSandbox {
+    root: PathBuf,
+    /// Canonical paths of symlink targets found under root at construction time.
+    allowed_targets: Vec<PathBuf>,
+}
+
+impl SymlinkAwareSandbox {
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, InitError> {
+        let raw = root.into();
+        let canonical = match raw.canonicalize() {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(InitError::RootNotFound { path: raw });
+            }
+            Err(e) => {
+                return Err(InitError::Io {
+                    path: raw,
+                    source: e,
+                });
+            }
+        };
+
+        let mut allowed_targets = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&canonical) {
+            for entry in entries.flatten() {
+                let meta = match entry.path().symlink_metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                if meta.file_type().is_symlink() {
+                    if let Ok(target) = entry.path().canonicalize() {
+                        allowed_targets.push(target);
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            root: canonical,
+            allowed_targets,
+        })
+    }
+}
+
+impl SandboxedFs for SymlinkAwareSandbox {
+    fn read(&self, relative: &Path) -> Result<Option<FileContent>, ReadError> {
+        let path = self.root.join(relative);
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(ReadError::Io { path, source: e });
+            }
+        };
+
+        // Allow if under root (normal case, no symlinks involved)
+        if canonical.starts_with(&self.root) {
+            return read_file(&canonical);
+        }
+
+        // Allow if under any registered symlink target
+        for target in &self.allowed_targets {
+            if canonical.starts_with(target) {
+                return read_file(&canonical);
+            }
+        }
+
+        Err(ReadError::Traversal {
+            attempted: canonical,
+        })
+    }
+}
+
+/// Shared file reading logic.
+fn read_file(canonical: &Path) -> Result<Option<FileContent>, ReadError> {
+    match std::fs::read_to_string(canonical) {
+        Ok(content) => Ok(Some(FileContent {
+            content,
+            resolved_path: canonical.to_path_buf(),
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ReadError::Io {
+            path: canonical.to_path_buf(),
+            source: e,
+        }),
+    }
+}
+
 // -- CapSandbox --
 
 /// Capability-based sandbox using [`cap_std`].
