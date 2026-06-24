@@ -42,7 +42,7 @@ use std::path::{Path, PathBuf};
 
 use mlua::{Lua, LuaSerdeExt, Result, Value};
 
-use crate::sandbox::{FsSandbox, InitError, ReadError, SandboxedFs};
+use crate::sandbox::{FsSandbox, InitError, ReadError, SandboxedFs, SymlinkAwareSandbox};
 use crate::{ResolveError, Resolver};
 
 type NativeFactory = Box<dyn Fn(&Lua) -> Result<Value> + Send + Sync>;
@@ -560,7 +560,8 @@ impl VendoredResolver {
     pub fn new(
         vendored_root: impl Into<PathBuf>,
     ) -> std::result::Result<Self, crate::sandbox::InitError> {
-        let inner = FsResolver::new(vendored_root)?;
+        let sandbox = SymlinkAwareSandbox::new(vendored_root)?;
+        let inner = FsResolver::with_sandbox(sandbox);
         Ok(Self { inner })
     }
 
@@ -612,10 +613,12 @@ impl VendoredResolver {
             }
         }
 
-        // Construct the inner FsResolver.  If vendored_root was just created it
-        // is empty; that is fine — resolve() will return None for all names
-        // until `mlua-pkg install` populates the symlinks.
-        let inner = FsResolver::new(vendored_root).map_err(|e| {
+        // Construct the inner FsResolver backed by SymlinkAwareSandbox so that
+        // directory symlinks under vendored_root (created by `mlua-pkg install`)
+        // are followed and their targets are accessible.  If vendored_root was
+        // just created it is empty; that is fine — resolve() will return None
+        // for all names until `mlua-pkg install` populates the symlinks.
+        let sandbox = SymlinkAwareSandbox::new(vendored_root).map_err(|e| {
             // InitError::RootNotFound after we just created it would be unusual,
             // but surface it as an Io error to keep PkgError self-contained.
             crate::PkgError::Io {
@@ -625,6 +628,7 @@ impl VendoredResolver {
                 ),
             }
         })?;
+        let inner = FsResolver::with_sandbox(sandbox);
 
         Ok(Self { inner })
     }

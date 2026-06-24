@@ -175,6 +175,55 @@ let resolver = FsResolver::with_sandbox(CapSandbox::new("./scripts")?);
 For test mocking, implement `SandboxedFs` on your own type
 and inject it via `FsResolver::with_sandbox()` / `AssetResolver::with_sandbox()`.
 
+## Package manager (v0.4.0+)
+
+`mlua-pkg` includes a built-in package manager for installing Lua packages from
+git repositories.
+
+### Manifest (`mlua-pkg.toml`)
+
+```toml
+[package]
+name = "my-project"
+version = "0.1.0"
+
+[deps]
+lshape = { git = "https://github.com/ynishi/lshape", tag = "v0.1.0" }
+```
+
+### Install via CLI
+
+```sh
+mlua-pkg install
+```
+
+This fetches all packages declared in `mlua-pkg.toml`, writes `mlua-pkg.lock`
+with pinned SHAs, and creates symlinks under `.mlua-pkgs/vendored/`.
+
+### Use in Rust
+
+```rust
+use mlua::Lua;
+use mlua_pkg::{resolvers::VendoredResolver, Registry};
+
+fn setup(lua: &Lua) -> Result<(), Box<dyn std::error::Error>> {
+    // Read the lockfile written by `mlua-pkg install`.
+    let resolver = VendoredResolver::from_lockfile(
+        "mlua-pkg.lock",
+        ".mlua-pkgs/vendored",
+    )?;
+
+    let mut reg = Registry::new();
+    reg.add(resolver);
+    reg.install(lua)?;
+
+    Ok(())
+}
+
+// Lua side:
+// local lshape = require("lshape")
+```
+
 ## License
 
 Licensed under either of
