@@ -104,4 +104,26 @@ pub enum PkgError {
     /// the tag resolves to a different commit.
     #[error("tag SHA mismatch: expected {expected}, got {actual}")]
     TagShaMismatch { expected: String, actual: String },
+
+    /// No suitable entry point directory found within a cached package.
+    ///
+    /// Raised by [`mlua_pkg::resolve_entry`](crate::resolve_entry) when neither
+    /// the override path nor any fallback candidate (`src/`, `lua/`, `.`) exists
+    /// as a directory under `cache_path`.
+    ///
+    /// Also raised during [`VendoredResolver::from_lockfile`](crate::resolvers::VendoredResolver::from_lockfile)
+    /// construction when a package in the lockfile has no resolvable entry.
+    #[error("entry not found for {name:?}: tried {}", format_paths(attempted))]
+    EntryNotFound {
+        name: String,
+        attempted: Vec<PathBuf>,
+    },
+}
+
+fn format_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }

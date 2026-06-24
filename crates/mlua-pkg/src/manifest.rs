@@ -31,7 +31,11 @@
 //! entry   = "src"
 //! ```
 
-use std::{collections::HashMap, fs, path::{Path, PathBuf}};
+use std::{
+    collections::HashMap,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -92,10 +96,14 @@ pub struct Dep {
 impl Dep {
     /// Validate that at most one of `tag`, `rev`, `branch` is set.
     fn validate_ref_exclusivity(&self, dep_name: &str) -> Result<(), PkgError> {
-        let count = [self.tag.is_some(), self.rev.is_some(), self.branch.is_some()]
-            .into_iter()
-            .filter(|&b| b)
-            .count();
+        let count = [
+            self.tag.is_some(),
+            self.rev.is_some(),
+            self.branch.is_some(),
+        ]
+        .into_iter()
+        .filter(|&b| b)
+        .count();
         if count > 1 {
             return Err(PkgError::Validation {
                 message: format!(

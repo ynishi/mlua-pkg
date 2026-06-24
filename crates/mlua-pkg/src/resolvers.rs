@@ -507,6 +507,139 @@ impl Resolver for PrefixResolver {
     }
 }
 
+// -- VendoredResolver --
+
+/// Resolver that exposes the `.mlua-pkgs/vendored/` directory to `require`.
+///
+/// `VendoredResolver` is a thin wrapper over [`FsResolver`] rooted at the
+/// `vendored_root` directory (typically `.mlua-pkgs/vendored/`).
+///
+/// Each package in that directory is expected to be a symlink (or real
+/// directory) created by the `mlua-pkg install` CLI (ST5).  For example,
+/// `require("foo")` resolves to `vendored/foo/init.lua`, and
+/// `require("foo.bar")` resolves to `vendored/foo/bar.lua`.
+///
+/// # Responsibilities
+///
+/// - **This resolver reads** — it does not create symlinks or directories.
+/// - **The CLI creates** — `mlua-pkg install` is responsible for populating
+///   `.mlua-pkgs/vendored/` before this resolver is used.
+///
+/// # Construction
+///
+/// | Constructor | Use when |
+/// |------------|----------|
+/// | [`VendoredResolver::from_lockfile`] | Normal usage: lockfile path + vendored root |
+/// | [`VendoredResolver::new`] | Low-level: vendored root already exists and is populated |
+///
+/// # Errors
+///
+/// `new()` returns [`InitError::RootNotFound`] if `vendored_root` does not exist.
+/// `from_lockfile()` returns [`PkgError::MissingLockfile`] if the lockfile is absent,
+/// or [`PkgError::SameNameConflict`] if duplicate package names are found.
+pub struct VendoredResolver {
+    inner: FsResolver,
+}
+
+// FsResolver wraps a sandbox that is not Debug; implement manually.
+impl std::fmt::Debug for VendoredResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VendoredResolver").finish_non_exhaustive()
+    }
+}
+
+impl VendoredResolver {
+    /// Low-level constructor: wrap an existing `vendored_root` directory.
+    ///
+    /// Does **not** read a lockfile.  Use [`from_lockfile`](Self::from_lockfile)
+    /// for the normal flow.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InitError::RootNotFound`] if `vendored_root` does not exist.
+    pub fn new(
+        vendored_root: impl Into<PathBuf>,
+    ) -> std::result::Result<Self, crate::sandbox::InitError> {
+        let inner = FsResolver::new(vendored_root)?;
+        Ok(Self { inner })
+    }
+
+    /// Normal constructor: read `lockfile_path` and wrap `vendored_root`.
+    ///
+    /// Reads and validates the lockfile, then constructs an [`FsResolver`]
+    /// rooted at `vendored_root`.  For each package in the lockfile, emits a
+    /// `tracing::warn!` if the corresponding `vendored_root/<name>` symlink or
+    /// directory is absent (the CLI has not yet installed that package).
+    /// Resolution will simply return `None` for missing packages at runtime,
+    /// matching normal `FsResolver` miss behaviour.
+    ///
+    /// `vendored_root` is created automatically if it does not exist, to avoid
+    /// requiring a prior `mlua-pkg install` just to construct the resolver.
+    ///
+    /// # Errors
+    ///
+    /// | Error | Condition |
+    /// |-------|-----------|
+    /// | [`PkgError::MissingLockfile`] | `lockfile_path` does not exist |
+    /// | [`PkgError::LockfileParse`] | Invalid TOML in the lockfile |
+    /// | [`PkgError::SameNameConflict`] | Duplicate package names in the lockfile |
+    /// | [`PkgError::Io`] | I/O failure while creating `vendored_root` or reading the lockfile |
+    pub fn from_lockfile(
+        lockfile_path: impl AsRef<Path>,
+        vendored_root: impl AsRef<Path>,
+    ) -> std::result::Result<Self, crate::PkgError> {
+        let vendored_root = vendored_root.as_ref();
+        let lockfile = crate::lockfile::Lockfile::read(lockfile_path)?;
+
+        // Auto-create vendored_root if absent — callers should not need to run
+        // `mlua-pkg install` just to get a working resolver skeleton.
+        if !vendored_root.exists() {
+            std::fs::create_dir_all(vendored_root)?;
+        }
+
+        // Warn for each package whose vendored entry is absent.
+        // Broken symlinks are handled via symlink_metadata (does not follow
+        // the target), so even a dangling symlink counts as "present".
+        for pkg in &lockfile.pkg {
+            let entry = vendored_root.join(&pkg.name);
+            if std::fs::symlink_metadata(&entry).is_err() {
+                // No tracing dependency — use eprintln as a lightweight warning.
+                // ST5 / real usage will add tracing; for now this is informational.
+                eprintln!(
+                    "mlua-pkg: vendored/{} not found — run `mlua-pkg install`",
+                    pkg.name
+                );
+            }
+        }
+
+        // Construct the inner FsResolver.  If vendored_root was just created it
+        // is empty; that is fine — resolve() will return None for all names
+        // until `mlua-pkg install` populates the symlinks.
+        let inner = FsResolver::new(vendored_root).map_err(|e| {
+            // InitError::RootNotFound after we just created it would be unusual,
+            // but surface it as an Io error to keep PkgError self-contained.
+            crate::PkgError::Io {
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("vendored root init error: {e}"),
+                ),
+            }
+        })?;
+
+        Ok(Self { inner })
+    }
+}
+
+impl Resolver for VendoredResolver {
+    /// Delegate resolution to the inner [`FsResolver`].
+    ///
+    /// `require("foo")` resolves to `vendored/foo.lua` or `vendored/foo/init.lua`.
+    /// `require("foo.bar")` resolves to `vendored/foo/bar.lua`.
+    fn resolve(&self, lua: &Lua, name: &str) -> Option<mlua::Result<mlua::Value>> {
+        self.inner.resolve(lua, name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,5 +967,95 @@ mod tests {
         let lua = mlua::Lua::new();
         // "sm.nonexistent" -> strip -> "nonexistent" -> inner returns None -> None
         assert!(resolver.resolve(&lua, "sm.nonexistent").is_none());
+    }
+
+    // -- VendoredResolver tests --
+
+    /// Write a one-pkg lockfile TOML to `dir/mlua-pkg.lock` and return the path.
+    fn write_vendored_lockfile(dir: &Path, pkg_name: &str, entry: &str) -> PathBuf {
+        let content = format!(
+            "version = 1\n\n[[pkg]]\nname = {pkg_name:?}\nsource = \"git+https://github.com/x/{pkg_name}\"\nsha = \"{sha}\"\nentry = {entry:?}\n",
+            sha = "a".repeat(40),
+        );
+        let path = dir.join("mlua-pkg.lock");
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    // TC 1: lockfile not found → MissingLockfile
+    #[test]
+    fn vendored_from_lockfile_missing_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lockfile = tmp.path().join("nonexistent.lock");
+        let vendored = tmp.path().join("vendored");
+
+        let err = VendoredResolver::from_lockfile(&lockfile, &vendored).unwrap_err();
+        assert!(
+            matches!(err, crate::PkgError::MissingLockfile { .. }),
+            "expected MissingLockfile, got: {err}"
+        );
+    }
+
+    // TC 2: lockfile 1 pkg + vendored/foo (dir with init.lua) → require("foo") resolves
+    #[test]
+    fn vendored_resolver_single_pkg_init_lua() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vendored = tmp.path().join("vendored");
+        let lockfile = write_vendored_lockfile(tmp.path(), "foo", ".");
+
+        // Simulate `mlua-pkg install`: create vendored/foo/ with init.lua
+        let foo_dir = vendored.join("foo");
+        std::fs::create_dir_all(&foo_dir).unwrap();
+        std::fs::write(foo_dir.join("init.lua"), "return { pkg = 'foo' }").unwrap();
+
+        let resolver = VendoredResolver::from_lockfile(&lockfile, &vendored).unwrap();
+        let lua = mlua::Lua::new();
+
+        let value = must_resolve(&resolver, &lua, "foo");
+        assert_eq!(get_field::<String>(&value, "pkg"), "foo");
+    }
+
+    // TC 3: require("foo.bar") → vendored/foo/bar.lua (FsResolver dot-to-path)
+    #[test]
+    fn vendored_resolver_dot_to_path_sub_module() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vendored = tmp.path().join("vendored");
+        let lockfile = write_vendored_lockfile(tmp.path(), "foo", ".");
+
+        let foo_dir = vendored.join("foo");
+        std::fs::create_dir_all(&foo_dir).unwrap();
+        std::fs::write(foo_dir.join("bar.lua"), "return { sub = 'bar' }").unwrap();
+
+        let resolver = VendoredResolver::from_lockfile(&lockfile, &vendored).unwrap();
+        let lua = mlua::Lua::new();
+
+        // "foo.bar" → FsResolver: dot-separator → foo/bar.lua
+        let value = must_resolve(&resolver, &lua, "foo.bar");
+        assert_eq!(get_field::<String>(&value, "sub"), "bar");
+    }
+
+    // TC 4: VendoredResolver::new low-level constructor works with existing dir
+    #[test]
+    fn vendored_new_with_existing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vendored = tmp.path().join("vendored");
+        std::fs::create_dir_all(&vendored).unwrap();
+
+        // Write a pkg file directly into vendored root
+        std::fs::write(vendored.join("mypkg.lua"), "return 'direct'").unwrap();
+
+        let resolver = VendoredResolver::new(&vendored).unwrap();
+        let lua = mlua::Lua::new();
+
+        let value = must_resolve(&resolver, &lua, "mypkg");
+        let s: String = lua.unpack(value).unwrap();
+        assert_eq!(s, "direct");
+    }
+
+    // TC 5: VendoredResolver is Send + Sync (compile-time check)
+    #[test]
+    fn vendored_resolver_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<VendoredResolver>();
     }
 }

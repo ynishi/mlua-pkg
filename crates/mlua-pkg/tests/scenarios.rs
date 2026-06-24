@@ -670,7 +670,11 @@ fn symlink_aware_sandbox_submodule_in_linked_pkg() {
     let external = dir.path().join("ext_pkg");
     std::fs::create_dir_all(external.join("sub")).unwrap();
     std::fs::write(external.join("init.lua"), "return { root = true }").unwrap();
-    std::fs::write(external.join("sub").join("init.lua"), "return { sub = true }").unwrap();
+    std::fs::write(
+        external.join("sub").join("init.lua"),
+        "return { sub = true }",
+    )
+    .unwrap();
 
     let sandbox = dir.path().join("sandbox");
     std::fs::create_dir_all(&sandbox).unwrap();

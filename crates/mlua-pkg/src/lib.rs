@@ -169,7 +169,69 @@ pub mod sandbox;
 pub use error::PkgError;
 
 use mlua::{Lua, Result, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Resolve the Lua `require` entry point directory for a cached package.
+///
+/// Applies the entry fallback chain in order:
+///
+/// 1. If `override_entry` is `Some(p)`, check `cache_path.join(p)` only.
+///    If it is not a directory, return [`PkgError::EntryNotFound`] immediately
+///    (the override is explicit, so fallback would be surprising).
+/// 2. Otherwise, try the default candidates in order:
+///    - `cache_path/src/`
+///    - `cache_path/lua/`
+///    - `cache_path/` itself (`.`)
+///
+/// Returns the first candidate that is a directory, or
+/// [`PkgError::EntryNotFound`] if none exist.
+///
+/// # Notes
+///
+/// This function is used by the `install` CLI (ST5) to determine the symlink
+/// target for each vendored package. [`resolvers::VendoredResolver`] itself does
+/// not call this function — the lockfile already carries the resolved `entry`
+/// field, and the CLI's symlink points `vendored/<name>` at
+/// `../cache/…/<sha>/<entry>` before the resolver is constructed.
+///
+/// # Errors
+///
+/// Returns [`PkgError::EntryNotFound`] when no candidate directory exists.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use mlua_pkg::resolve_entry;
+/// use std::path::Path;
+///
+/// let entry = resolve_entry(Path::new("/cache/mypkg/abc123"), None)?;
+/// // => /cache/mypkg/abc123/src  (if that directory exists)
+/// # Ok::<(), mlua_pkg::PkgError>(())
+/// ```
+pub fn resolve_entry(
+    cache_path: &Path,
+    override_entry: Option<&Path>,
+) -> std::result::Result<PathBuf, PkgError> {
+    let candidates: Vec<PathBuf> = match override_entry {
+        Some(e) => vec![cache_path.join(e)],
+        None => vec![
+            cache_path.join("src"),
+            cache_path.join("lua"),
+            cache_path.to_path_buf(),
+        ],
+    };
+
+    for c in &candidates {
+        if c.is_dir() {
+            return Ok(c.clone());
+        }
+    }
+
+    Err(PkgError::EntryNotFound {
+        name: cache_path.display().to_string(),
+        attempted: candidates,
+    })
+}
 
 /// Configuration bundle for Lua dialect naming conventions.
 ///
@@ -452,6 +514,83 @@ mod tests {
         assert!(
             err.to_string().contains("already installed"),
             "expected 'already installed' error, got: {err}"
+        );
+    }
+
+    // -- resolve_entry helper tests --
+
+    // TC 4: entry fallback — src/ takes priority when it exists as a dir
+    #[test]
+    fn vendored_resolve_entry_src_priority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+
+        // Create src/ and lua/ sub-directories; resolve_entry should pick src/ first.
+        std::fs::create_dir_all(cache.join("src")).unwrap();
+        std::fs::create_dir_all(cache.join("lua")).unwrap();
+
+        let result = resolve_entry(cache, None).unwrap();
+        assert_eq!(result, cache.join("src"));
+    }
+
+    // TC 4b: fallback to lua/ when src/ is absent
+    #[test]
+    fn vendored_resolve_entry_lua_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+
+        std::fs::create_dir_all(cache.join("lua")).unwrap();
+
+        let result = resolve_entry(cache, None).unwrap();
+        assert_eq!(result, cache.join("lua"));
+    }
+
+    // TC 4c: override entry is respected and src/ is not tried
+    #[test]
+    fn vendored_resolve_entry_override_respected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+
+        // "src/" exists but we override to "lib/"
+        std::fs::create_dir_all(cache.join("src")).unwrap();
+        std::fs::create_dir_all(cache.join("lib")).unwrap();
+
+        let result = resolve_entry(cache, Some(Path::new("lib"))).unwrap();
+        assert_eq!(result, cache.join("lib"));
+    }
+
+    // TC 5: all candidates absent → EntryNotFound
+    #[test]
+    fn vendored_resolve_entry_all_absent_returns_entry_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        // cache dir exists but has no src/, lua/, or meaningful root
+        // (the root itself is a dir, so the last fallback `cache_path` would succeed)
+        // To test EntryNotFound we need all three to fail. Root is the tmp dir itself.
+        // Make a sub-path that does NOT exist as a directory.
+        let non_dir = tmp.path().join("no_such_dir");
+        // non_dir does not exist at all, so c.is_dir() = false for all candidates
+        // candidates: non_dir/src, non_dir/lua, non_dir itself (non-existent)
+
+        let err = resolve_entry(&non_dir, None).unwrap_err();
+        assert!(
+            matches!(err, PkgError::EntryNotFound { .. }),
+            "expected EntryNotFound, got: {err}"
+        );
+    }
+
+    // TC 5b: override entry absent → EntryNotFound immediately (no fallback)
+    #[test]
+    fn vendored_resolve_entry_override_absent_no_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+
+        // src/ exists but override points to nonexistent "custom/"
+        std::fs::create_dir_all(cache.join("src")).unwrap();
+
+        let err = resolve_entry(cache, Some(Path::new("custom"))).unwrap_err();
+        assert!(
+            matches!(err, PkgError::EntryNotFound { .. }),
+            "expected EntryNotFound when override is absent, got: {err}"
         );
     }
 }
