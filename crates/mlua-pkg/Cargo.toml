@@ -15,8 +15,14 @@ include = ["src/**/*", "tests/**/*", "LICENSE-*"]
 [features]
 sandbox-cap-std = ["dep:cap-std"]
 
+[[bin]]
+name = "mlua-pkg"
+path = "src/bin/mlua-pkg.rs"
+
 [dependencies]
+anyhow = "1"
 cap-std = { version = "4", optional = true }
+clap = { version = "4", features = ["derive"] }
 git2 = "0.18"
 mlua = { version = "0.11", features = ["lua54", "vendored", "serialize"] }
 serde = { version = "1", features = ["derive"] }
