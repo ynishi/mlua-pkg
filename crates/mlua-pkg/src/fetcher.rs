@@ -220,6 +220,16 @@ impl GitFetcher {
         Ok(oid.to_string())
     }
 
+    /// Reset the worktree of `repo` hard to the commit named by `sha`.
+    fn checkout_sha(repo: &Repository, sha: &str) -> Result<(), PkgError> {
+        let oid = git2::Oid::from_str(sha).map_err(|e| PkgError::Validation {
+            message: format!("invalid SHA {sha}: {e}"),
+        })?;
+        let obj = repo.find_object(oid, None)?;
+        repo.reset(&obj, git2::ResetType::Hard, None)?;
+        Ok(())
+    }
+
     /// Build `FetchOptions` with the credential cascade callback.
     fn make_fetch_options() -> FetchOptions<'static> {
         let mut callbacks = RemoteCallbacks::new();
@@ -296,6 +306,16 @@ impl Fetcher for GitFetcher {
                 return Err(e);
             }
         };
+
+        // ── Checkout resolved commit ─────────────────────────────────────────
+        // `clone()` leaves the worktree at the cloned HEAD (= default branch
+        // tip), which for tag/rev/branch lookups is the wrong commit.  Reset
+        // hard to the resolved SHA so the cached content matches the SHA we
+        // pin in the lockfile.
+        if let Err(e) = Self::checkout_sha(&repo, &sha) {
+            let _ = std::fs::remove_dir_all(&tmp_path);
+            return Err(e);
+        }
 
         // ── Compute final cache path ─────────────────────────────────────────
         let cache_path = match self.cache_dir(url, &sha) {
@@ -583,7 +603,74 @@ version = "0.1.0"
         assert_eq!(manifest.package.version, "0.1.0");
     }
 
-    // ── 8. cache_dir rejects SHA with non-hex chars ───────────────────────────
+    // ── 8. fetched worktree content matches the resolved ref, not HEAD ───────
+    //
+    // Regression for the v0.4.0 bug where fetch() resolved the SHA from
+    // `tag = "v0.1.0"` and pinned it in the lockfile / cache dir name, but
+    // left the worktree at the cloned HEAD (= default branch tip).  Consumers
+    // therefore got the latest content with a stale SHA — reproducibility lost.
+
+    #[test]
+    fn fetched_worktree_matches_resolved_tag_not_head() {
+        let src = TempDir::new().unwrap();
+        let repo = Repository::init(src.path()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test").unwrap();
+        config.set_str("user.email", "test@example.com").unwrap();
+        drop(config);
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+
+        // Commit 1: VERSION = "0.1.0", tagged v0.1.0.
+        fs::write(src.path().join("VERSION"), "0.1.0").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("VERSION")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let c1 = repo
+            .commit(Some("HEAD"), &sig, &sig, "v0.1.0", &tree, &[])
+            .unwrap();
+        let c1_obj = repo.find_object(c1, None).unwrap();
+        repo.tag("v0.1.0", &c1_obj, &sig, "v0.1.0", false).unwrap();
+        let v010_sha = c1.to_string();
+
+        // Commit 2: VERSION = "0.2.0", HEAD advances. No tag.
+        fs::write(src.path().join("VERSION"), "0.2.0").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(std::path::Path::new("VERSION")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.find_commit(c1).unwrap();
+        let c2 = repo
+            .commit(Some("HEAD"), &sig, &sig, "v0.2.0", &tree, &[&parent])
+            .unwrap();
+        assert_ne!(c1, c2, "HEAD must have advanced past the tag");
+
+        // Fetch tag v0.1.0.
+        let cache_root = TempDir::new().unwrap();
+        let fetcher = GitFetcher::new(cache_root.path().to_path_buf());
+        let dep = Dep {
+            git: format!("file://{}", src.path().display()),
+            tag: Some("v0.1.0".to_string()),
+            rev: None,
+            branch: None,
+            entry: None,
+        };
+        let fetched = fetcher.fetch(&dep).unwrap();
+
+        // SHA must point at the tag commit, not HEAD.
+        assert_eq!(fetched.sha, v010_sha, "SHA must resolve to tag commit");
+
+        // Worktree content must match the tag commit content, not HEAD's.
+        let version = fs::read_to_string(fetched.cache_path.join("VERSION")).unwrap();
+        assert_eq!(
+            version, "0.1.0",
+            "fetched worktree must contain tag v0.1.0 content, got HEAD content instead"
+        );
+    }
+
+    // ── 9. cache_dir rejects SHA with non-hex chars ───────────────────────────
 
     #[test]
     fn cache_dir_rejects_invalid_sha() {

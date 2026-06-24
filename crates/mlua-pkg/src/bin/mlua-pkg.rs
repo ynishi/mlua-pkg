@@ -825,7 +825,10 @@ mod tests {
             "install".to_string(),
         ];
         let out = strip_cargo_subcommand(input);
-        assert_eq!(out, vec!["cargo-mlua-pkg".to_string(), "install".to_string()]);
+        assert_eq!(
+            out,
+            vec!["cargo-mlua-pkg".to_string(), "install".to_string()]
+        );
     }
 
     #[test]

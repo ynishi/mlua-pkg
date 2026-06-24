@@ -360,3 +360,34 @@ fn install_lshape_from_github() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+/// Regression: the fetched worktree must contain the **tag v0.1.0** content,
+/// not the upstream HEAD content (`main` is at v0.2.0).  This guards against
+/// the v0.4.0 bug where `fetch()` resolved the tag SHA correctly but left
+/// the worktree on the cloned default branch HEAD.
+#[test]
+#[ignore = "requires network — opt-in via `cargo test -- --ignored`"]
+fn install_lshape_v010_has_correct_content() -> Result<(), Box<dyn std::error::Error>> {
+    let workspace = TempDir::new()?;
+    let cache_dir = workspace.path().join("cache");
+    let fetcher = GitFetcher::new(cache_dir);
+
+    let dep = Dep {
+        git: "https://github.com/ynishi/lshape".to_string(),
+        tag: Some("v0.1.0".to_string()),
+        rev: None,
+        branch: None,
+        entry: None,
+    };
+    let fetched = fetcher.fetch(&dep)?;
+
+    let init_lua = fs::read_to_string(fetched.cache_path.join("lshape/init.lua"))?;
+    assert!(
+        init_lua.contains(r#"M._VERSION = "0.1.0""#),
+        "expected M._VERSION = \"0.1.0\" in the v0.1.0 tag content, \
+         but found upstream HEAD content instead.  fetcher checked out the \
+         wrong commit."
+    );
+
+    Ok(())
+}

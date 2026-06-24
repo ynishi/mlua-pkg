@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.1] - 2026-06-25
+
+### Fixed
+
+- **`GitFetcher` now checks out the resolved commit.** v0.4.0 cloned the
+  repository and pinned the SHA correctly in the cache directory name and
+  lockfile, but left the worktree on the cloned default-branch `HEAD`.
+  Consumers requesting `tag = "v0.1.0"` received the content of `main`
+  instead, breaking reproducibility.  Fix resets the worktree hard to the
+  resolved SHA right after `resolve_sha`.
+
+### Added
+
+- Regression unit test (`fetched_worktree_matches_resolved_tag_not_head`)
+  that creates two commits, tags the first, and asserts the fetched
+  worktree contains the tag-commit content.
+- Network E2E (`install_lshape_v010_has_correct_content`, `#[ignore]`)
+  that fetches `ynishi/lshape` v0.1.0 and asserts `M._VERSION = "0.1.0"`.
+
 ## [0.4.0] - 2026-06-24
 
 ### Added
