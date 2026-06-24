@@ -56,6 +56,9 @@ enum Cmd {
         /// Override the Lua `require()` entry subdir.
         #[arg(long)]
         entry: Option<PathBuf>,
+        /// Physically vendor the entry into this directory (manifest-relative).
+        #[arg(long)]
+        target_dir: Option<PathBuf>,
     },
 
     /// Re-fetch packages from the manifest (MVP: re-installs all packages).
@@ -104,6 +107,7 @@ fn main() -> anyhow::Result<()> {
             rev,
             branch,
             entry,
+            target_dir,
         } => run_add(
             Path::new("mlua-pkg.toml"),
             name,
@@ -112,6 +116,7 @@ fn main() -> anyhow::Result<()> {
             rev,
             branch,
             entry,
+            target_dir,
         ),
         Cmd::Update { name } => run_update(
             name,
@@ -181,13 +186,24 @@ fn run_install(
         let entry_abs = resolve_entry(&fetched.cache_path, override_entry)
             .with_context(|| format!("resolving entry for '{name}'"))?;
 
-        // Create relative symlink: .mlua-pkgs/vendored/<name> → ../cache/git/…
-        let symlink_path = vendored_dir.join(name);
-        if symlink_path.symlink_metadata().is_ok() {
-            remove_symlink(&symlink_path)?;
+        if let Some(rel_target_dir) = &dep.target_dir {
+            // Physical vendor copy: manifest-relative directory, idempotent.
+            let manifest_root = manifest_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let dest = manifest_root.join(rel_target_dir);
+            copy_entry_into(&entry_abs, &dest)
+                .with_context(|| format!("vendoring '{name}' into {}", dest.display()))?;
+        } else {
+            // Default: relative symlink .mlua-pkgs/vendored/<name> → ../cache/git/…
+            let symlink_path = vendored_dir.join(name);
+            if symlink_path.symlink_metadata().is_ok() {
+                remove_symlink(&symlink_path)?;
+            }
+            let rel_target = relative_path(vendored_dir, &entry_abs)?;
+            create_symlink(&rel_target, &symlink_path)?;
         }
-        let rel_target = relative_path(vendored_dir, &entry_abs)?;
-        create_symlink(&rel_target, &symlink_path)?;
 
         // Compute entry relative to the package cache root for the lockfile.
         let entry = entry_rel_to_pkg(&fetched.cache_path, &entry_abs);
@@ -213,6 +229,43 @@ fn run_install(
     Ok(())
 }
 
+/// Recursively copy the contents of `src` into `dest`, removing `dest` first
+/// so the copy is idempotent (subsequent installs reflect upstream changes /
+/// renames / deletions).
+fn copy_entry_into(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if dest.exists() {
+        std::fs::remove_dir_all(dest)?;
+    }
+    std::fs::create_dir_all(dest)?;
+    copy_dir_contents(src, dest)
+}
+
+fn copy_dir_contents(src: &Path, dest: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            copy_dir_contents(&from, &to)?;
+        } else if ft.is_symlink() {
+            // Materialise into a regular file/dir (vendored output should not
+            // depend on the cache symlink topology).
+            let resolved = std::fs::canonicalize(&from)?;
+            if resolved.is_dir() {
+                std::fs::create_dir_all(&to)?;
+                copy_dir_contents(&resolved, &to)?;
+            } else {
+                std::fs::copy(&resolved, &to)?;
+            }
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 /// Strip `cache_path` prefix from `entry_abs`; return `"."` for the repo root.
 fn entry_rel_to_pkg(cache_path: &Path, entry_abs: &Path) -> PathBuf {
     match entry_abs.strip_prefix(cache_path) {
@@ -224,6 +277,7 @@ fn entry_rel_to_pkg(cache_path: &Path, entry_abs: &Path) -> PathBuf {
 
 // ── add ───────────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn run_add(
     manifest_path: &Path,
     name: String,
@@ -232,6 +286,7 @@ fn run_add(
     rev: Option<String>,
     branch: Option<String>,
     entry: Option<PathBuf>,
+    target_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     // Validate ref-field exclusivity up front.
     let ref_count = [tag.is_some(), rev.is_some(), branch.is_some()]
@@ -269,6 +324,7 @@ fn run_add(
         rev,
         branch,
         entry,
+        target_dir,
     };
     let existed = manifest.deps.insert(name.clone(), dep).is_some();
 
@@ -546,6 +602,80 @@ mod tests {
     }
 
     #[test]
+    fn install_with_target_dir_physically_copies() {
+        let remote = TempDir::new().unwrap();
+        let sha = init_repo_with_commit(remote.path());
+
+        let project = TempDir::new().unwrap();
+        let manifest_path = project.path().join("mlua-pkg.toml");
+        let cache_dir = project.path().join(".mlua-pkgs/cache");
+        let vendored_dir = project.path().join(".mlua-pkgs/vendored");
+        let lock_path = project.path().join("mlua-pkg.lock");
+
+        let url = format!("file://{}", remote.path().display());
+        write_file(
+            &manifest_path,
+            &format!(
+                "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n\
+                 [deps]\nmylib = {{ git = \"{url}\", rev = \"{sha}\", \
+                 target_dir = \"lua/mylib\" }}\n"
+            ),
+        );
+
+        run_install(&manifest_path, &cache_dir, &vendored_dir, &lock_path).unwrap();
+
+        // target_dir holds a real file (not a symlink).
+        let vendored_file = project.path().join("lua/mylib/main.lua");
+        assert!(
+            vendored_file.exists(),
+            "vendored file must exist at target_dir"
+        );
+        let meta = std::fs::symlink_metadata(&vendored_file).unwrap();
+        assert!(
+            !meta.file_type().is_symlink(),
+            "vendored output must be a regular file, not a symlink"
+        );
+
+        // Default symlink path must NOT be created when target_dir is set.
+        assert!(
+            vendored_dir.join("mylib").symlink_metadata().is_err(),
+            ".mlua-pkgs/vendored/<name> must not be created when target_dir is set"
+        );
+
+        // Lockfile entry still recorded.
+        let lf = Lockfile::read(&lock_path).unwrap();
+        assert_eq!(lf.pkg.len(), 1);
+        assert_eq!(lf.pkg[0].sha, sha);
+    }
+
+    #[test]
+    fn install_with_target_dir_is_idempotent() {
+        let remote = TempDir::new().unwrap();
+        let sha = init_repo_with_commit(remote.path());
+
+        let project = TempDir::new().unwrap();
+        let manifest_path = project.path().join("mlua-pkg.toml");
+        let cache_dir = project.path().join(".mlua-pkgs/cache");
+        let vendored_dir = project.path().join(".mlua-pkgs/vendored");
+        let lock_path = project.path().join("mlua-pkg.lock");
+
+        let url = format!("file://{}", remote.path().display());
+        write_file(
+            &manifest_path,
+            &format!(
+                "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n\
+                 [deps]\nmylib = {{ git = \"{url}\", rev = \"{sha}\", \
+                 target_dir = \"lua/mylib\" }}\n"
+            ),
+        );
+
+        run_install(&manifest_path, &cache_dir, &vendored_dir, &lock_path).unwrap();
+        run_install(&manifest_path, &cache_dir, &vendored_dir, &lock_path).unwrap();
+
+        assert!(project.path().join("lua/mylib/main.lua").exists());
+    }
+
+    #[test]
     fn install_missing_manifest_returns_error() {
         let project = TempDir::new().unwrap();
         let result = run_install(
@@ -600,6 +730,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -631,6 +762,7 @@ mod tests {
             Some("abc1234567890123456789012345678901234567890".to_string()),
             None,
             None,
+            None,
         )
         .unwrap();
 
@@ -651,6 +783,7 @@ mod tests {
             "https://github.com/x/lib".to_string(),
             Some("v1.0.0".to_string()),
             Some("abc123".to_string()),
+            None,
             None,
             None,
         );

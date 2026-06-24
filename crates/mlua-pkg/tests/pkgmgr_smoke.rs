@@ -209,6 +209,7 @@ fn sha_fixation_idempotent_fetch() -> Result<(), Box<dyn std::error::Error>> {
         rev: None,
         branch: None,
         entry: None,
+        target_dir: None,
     };
 
     let first = fetcher.fetch(&dep)?;
@@ -246,6 +247,7 @@ fn resolve_entry_fallback_to_root() -> Result<(), Box<dyn std::error::Error>> {
         rev: None,
         branch: None,
         entry: None,
+        target_dir: None,
     };
 
     let fetched = fetcher.fetch(&dep)?;
@@ -281,6 +283,7 @@ fn resolve_entry_prefers_src() -> Result<(), Box<dyn std::error::Error>> {
         rev: None,
         branch: None,
         entry: None,
+        target_dir: None,
     };
 
     let fetched = fetcher.fetch(&dep)?;
@@ -318,6 +321,7 @@ fn install_lshape_from_github() -> Result<(), Box<dyn std::error::Error>> {
         rev: None,
         branch: None,
         entry: None,
+        target_dir: None,
     };
 
     let fetched = fetcher.fetch(&dep)?;
@@ -378,6 +382,7 @@ fn install_lshape_v010_has_correct_content() -> Result<(), Box<dyn std::error::E
         rev: None,
         branch: None,
         entry: None,
+        target_dir: None,
     };
     let fetched = fetcher.fetch(&dep)?;
 

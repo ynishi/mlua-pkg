@@ -417,6 +417,7 @@ mod tests {
             rev: None,
             branch: None,
             entry: None,
+            target_dir: None,
         };
 
         let result = fetcher.fetch(&dep).unwrap();
@@ -448,6 +449,7 @@ mod tests {
             rev: None,
             branch: None,
             entry: None,
+            target_dir: None,
         };
 
         let result = fetcher.fetch(&dep).unwrap();
@@ -472,6 +474,7 @@ mod tests {
             tag: None,
             branch: None,
             entry: None,
+            target_dir: None,
         };
 
         let result = fetcher.fetch(&dep).unwrap();
@@ -491,6 +494,7 @@ mod tests {
             rev: None,
             branch: None,
             entry: None,
+            target_dir: None,
         };
 
         let err = fetcher.fetch(&dep).unwrap_err();
@@ -517,6 +521,7 @@ mod tests {
             tag: None,
             branch: None,
             entry: None,
+            target_dir: None,
         };
 
         let first = fetcher.fetch(&dep).unwrap();
@@ -542,6 +547,7 @@ mod tests {
             rev: None,
             branch: None,
             entry: None,
+            target_dir: None,
         };
 
         let err = fetcher.fetch(&dep).unwrap_err();
@@ -595,6 +601,7 @@ version = "0.1.0"
             rev: None,
             branch: None,
             entry: None,
+            target_dir: None,
         };
 
         let result = fetcher.fetch(&dep).unwrap();
@@ -656,6 +663,7 @@ version = "0.1.0"
             rev: None,
             branch: None,
             entry: None,
+            target_dir: None,
         };
         let fetched = fetcher.fetch(&dep).unwrap();
 

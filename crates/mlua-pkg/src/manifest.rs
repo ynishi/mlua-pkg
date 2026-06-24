@@ -91,6 +91,13 @@ pub struct Dep {
     /// Takes precedence over the author's own `[package].entry`.
     /// When absent, the author's `entry` (or the fallback chain) applies.
     pub entry: Option<PathBuf>,
+
+    /// Vendor target directory relative to the consumer's manifest.
+    ///
+    /// When set, `mlua-pkg install` physically copies the resolved entry
+    /// contents into this directory (versionable in the consumer's git tree)
+    /// instead of creating a `.mlua-pkgs/vendored/<name>` symlink.
+    pub target_dir: Option<PathBuf>,
 }
 
 impl Dep {
@@ -321,6 +328,7 @@ foo = { git = "https://github.com/x/foo", tag = "v1.0.0" }
                         rev: None,
                         branch: None,
                         entry: None,
+                        target_dir: None,
                     },
                 );
                 m
