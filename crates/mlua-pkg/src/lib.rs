@@ -160,6 +160,7 @@
 //! callers can choose the appropriate recovery strategy.
 
 pub mod error;
+pub mod fetcher;
 pub mod lockfile;
 pub mod manifest;
 pub mod resolvers;

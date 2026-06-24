@@ -20,6 +20,8 @@ use std::path::PathBuf;
 /// | [`SameNameConflict`](Self::SameNameConflict) | Validate | duplicate name in lockfile |
 /// | [`Io`](Self::Io) | I/O | [`std::io::Error`] via `#[from]` |
 /// | [`Validation`](Self::Validation) | Post-parse | custom message |
+/// | [`GitFetch`](Self::GitFetch) | Fetch | [`git2::Error`] via `#[from]` |
+/// | [`TagShaMismatch`](Self::TagShaMismatch) | Fetch | tag ↔ SHA conflict |
 ///
 /// Variants are `#[non_exhaustive]` so that future subtasks can add new
 /// variants without breaking downstream `match` arms that include a wildcard.
@@ -86,4 +88,20 @@ pub enum PkgError {
     /// single dependency entry.
     #[error("manifest validation error: {message}")]
     Validation { message: String },
+
+    /// git2 operation failure during fetch or clone.
+    ///
+    /// Automatically constructed from [`git2::Error`] via `?`.
+    #[error("git fetch error: {source}")]
+    GitFetch {
+        #[from]
+        source: git2::Error,
+    },
+
+    /// The resolved SHA for a tag did not match the expected SHA.
+    ///
+    /// Raised when the caller pins a specific SHA together with a tag and
+    /// the tag resolves to a different commit.
+    #[error("tag SHA mismatch: expected {expected}, got {actual}")]
+    TagShaMismatch { expected: String, actual: String },
 }
