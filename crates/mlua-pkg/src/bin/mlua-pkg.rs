@@ -61,10 +61,16 @@ enum Cmd {
         target_dir: Option<PathBuf>,
     },
 
-    /// Re-fetch packages from the manifest (MVP: re-installs all packages).
+    /// Refresh deps: bump SemVer-prefix tag pins, refresh branch pins, re-install.
     Update {
-        /// Package name to update (MVP: re-installs all regardless).
+        /// Package name to update.  When omitted, all deps are considered.
         name: Option<String>,
+        /// Show planned changes without writing the manifest or running install.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also bump exact (full SemVer) tag pins to the latest release.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Remove stale cached packages not referenced by the lockfile.
@@ -118,12 +124,18 @@ fn main() -> anyhow::Result<()> {
             entry,
             target_dir,
         ),
-        Cmd::Update { name } => run_update(
+        Cmd::Update {
+            name,
+            dry_run,
+            force,
+        } => run_update(
             name,
             Path::new("mlua-pkg.toml"),
             Path::new(".mlua-pkgs/cache"),
             Path::new(".mlua-pkgs/vendored"),
             Path::new("mlua-pkg.lock"),
+            dry_run,
+            force,
         ),
         Cmd::Clean { all } => run_clean(
             all,
@@ -349,17 +361,133 @@ fn run_add(
 
 // ── update ────────────────────────────────────────────────────────────────────
 
+/// Classification of a `[deps.<name>] tag = "..."` value.
+#[derive(Debug, PartialEq, Eq)]
+enum TagPin {
+    /// Full SemVer (X.Y.Z), optionally with pre-release. `update` leaves it
+    /// alone unless `--force` is passed.
+    Exact,
+    /// Partial SemVer (e.g. "v1.0", "v1") interpreted as a prefix that
+    /// auto-follows the latest matching release.  The numeric components are
+    /// returned in left-to-right order.
+    Prefix(Vec<u64>),
+}
+
+/// Strip a leading `v`/`V` from a tag string.
+fn strip_v_prefix(s: &str) -> &str {
+    s.strip_prefix('v')
+        .or_else(|| s.strip_prefix('V'))
+        .unwrap_or(s)
+}
+
+/// Classify the manifest `tag` field into [`TagPin::Exact`] or
+/// [`TagPin::Prefix`].  Returns `None` for unparseable values
+/// (e.g. `"latest"`, `"feature-branch"`); such pins are skipped on update.
+fn classify_tag_pin(tag: &str) -> Option<TagPin> {
+    let stripped = strip_v_prefix(tag);
+    if semver::Version::parse(stripped).is_ok() {
+        return Some(TagPin::Exact);
+    }
+    let parts: Option<Vec<u64>> = stripped.split('.').map(|s| s.parse::<u64>().ok()).collect();
+    let parts = parts?;
+    if parts.is_empty() || parts.len() >= 3 {
+        return None;
+    }
+    Some(TagPin::Prefix(parts))
+}
+
+/// Pick the SemVer-max tag from `tags` whose components match `pin`'s prefix.
+/// Pre-release tags (e.g. `v1.0.0-rc1`) are excluded.
+///
+/// Returns the original (un-stripped) tag string so the manifest can be
+/// rewritten verbatim.
+fn pick_latest_for_pin(tags: &[String], pin: &[u64]) -> Option<String> {
+    let mut best: Option<(semver::Version, &String)> = None;
+    for tag in tags {
+        let stripped = strip_v_prefix(tag);
+        let Ok(ver) = semver::Version::parse(stripped) else {
+            continue;
+        };
+        if !ver.pre.is_empty() {
+            continue;
+        }
+        let comps = [ver.major, ver.minor, ver.patch];
+        if pin.iter().zip(comps.iter()).any(|(p, c)| p != c) {
+            continue;
+        }
+        if pin.len() > comps.len() {
+            continue;
+        }
+        match &best {
+            None => best = Some((ver, tag)),
+            Some((b, _)) if &ver > b => best = Some((ver, tag)),
+            _ => {}
+        }
+    }
+    best.map(|(_, t)| t.clone())
+}
+
+/// Pick the SemVer-max release tag (used for `--force` on exact pins).
+fn pick_latest_overall(tags: &[String]) -> Option<String> {
+    let mut best: Option<(semver::Version, &String)> = None;
+    for tag in tags {
+        let stripped = strip_v_prefix(tag);
+        let Ok(ver) = semver::Version::parse(stripped) else {
+            continue;
+        };
+        if !ver.pre.is_empty() {
+            continue;
+        }
+        match &best {
+            None => best = Some((ver, tag)),
+            Some((b, _)) if &ver > b => best = Some((ver, tag)),
+            _ => {}
+        }
+    }
+    best.map(|(_, t)| t.clone())
+}
+
+/// Rewrite the `tag` value for `[deps.<name>]` in `doc`, preserving formatting.
+fn set_dep_tag(doc: &mut toml_edit::DocumentMut, name: &str, new_tag: &str) -> anyhow::Result<()> {
+    let deps = doc
+        .get_mut("deps")
+        .and_then(|i| i.as_table_like_mut())
+        .ok_or_else(|| anyhow::anyhow!("[deps] table missing"))?;
+    let entry = deps
+        .get_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("dep '{name}' missing in [deps]"))?;
+    if let Some(table) = entry.as_table_like_mut() {
+        table.insert("tag", toml_edit::value(new_tag));
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("dep '{name}' is not a table-like entry"))
+    }
+}
+
+/// Per-dep update outcome.
+#[derive(Debug)]
+enum UpdateOutcome {
+    /// Tag rewritten from `old` to `new` (manifest is mutated).
+    TagBumped { old: String, new: String },
+    /// Branch / no-pin dep: just re-install so lock picks up new HEAD.
+    Refresh,
+    /// Skipped (rev pin, exact tag without --force, unparseable tag, no remote match).
+    Skipped(String),
+}
+
 fn run_update(
     name: Option<String>,
     manifest_path: &Path,
     cache_dir: &Path,
     vendored_dir: &Path,
     lock_path: &Path,
+    dry_run: bool,
+    force: bool,
 ) -> anyhow::Result<()> {
-    // If a specific name was given, verify it exists in the manifest.
+    let manifest = Manifest::from_path(manifest_path)
+        .with_context(|| format!("reading {}", manifest_path.display()))?;
+
     if let Some(ref n) = name {
-        let manifest = Manifest::from_path(manifest_path)
-            .with_context(|| format!("reading {}", manifest_path.display()))?;
         if !manifest.deps.contains_key(n) {
             return Err(anyhow::anyhow!(
                 "unknown package '{}' in {}",
@@ -369,8 +497,114 @@ fn run_update(
         }
     }
 
-    // MVP: re-run install for all packages.
-    run_install(manifest_path, cache_dir, vendored_dir, lock_path)
+    let fetcher = GitFetcher::new(cache_dir.to_path_buf());
+    let raw = std::fs::read_to_string(manifest_path)?;
+    let mut doc: toml_edit::DocumentMut = raw.parse()?;
+
+    let mut any_refresh = false;
+    let mut summary: Vec<String> = Vec::new();
+
+    for (dep_name, dep) in &manifest.deps {
+        if let Some(ref n) = name {
+            if dep_name != n {
+                continue;
+            }
+        }
+
+        let outcome = update_dep(dep_name, dep, &fetcher, force)?;
+        match &outcome {
+            UpdateOutcome::TagBumped { old, new } => {
+                summary.push(format!("{dep_name}: tag {old} → {new}"));
+                if !dry_run {
+                    set_dep_tag(&mut doc, dep_name, new)?;
+                }
+                any_refresh = true;
+            }
+            UpdateOutcome::Refresh => {
+                summary.push(format!("{dep_name}: refresh (branch / unpinned)"));
+                any_refresh = true;
+            }
+            UpdateOutcome::Skipped(reason) => {
+                summary.push(format!("{dep_name}: skip ({reason})"));
+            }
+        }
+    }
+
+    if summary.is_empty() {
+        println!("no packages selected");
+        return Ok(());
+    }
+
+    for line in &summary {
+        println!("{line}");
+    }
+
+    if dry_run {
+        println!("(dry-run; manifest not modified)");
+        return Ok(());
+    }
+
+    std::fs::write(manifest_path, doc.to_string())?;
+
+    if any_refresh {
+        run_install(manifest_path, cache_dir, vendored_dir, lock_path)?;
+    }
+    Ok(())
+}
+
+fn update_dep(
+    name: &str,
+    dep: &Dep,
+    fetcher: &GitFetcher,
+    force: bool,
+) -> anyhow::Result<UpdateOutcome> {
+    if dep.rev.is_some() {
+        return Ok(UpdateOutcome::Skipped("rev pin".into()));
+    }
+    if dep.branch.is_some() {
+        return Ok(UpdateOutcome::Refresh);
+    }
+    let Some(current_tag) = &dep.tag else {
+        return Ok(UpdateOutcome::Refresh);
+    };
+
+    let pin = match classify_tag_pin(current_tag) {
+        Some(p) => p,
+        None => {
+            return Ok(UpdateOutcome::Skipped(format!(
+                "tag '{current_tag}' is not SemVer"
+            )))
+        }
+    };
+
+    let tags = fetcher
+        .list_tags(&dep.git)
+        .with_context(|| format!("listing tags for '{name}'"))?;
+
+    let new_tag = match (&pin, force) {
+        (TagPin::Exact, false) => {
+            return Ok(UpdateOutcome::Skipped(
+                "exact tag pin (pass --force to bump)".into(),
+            ))
+        }
+        (TagPin::Exact, true) => pick_latest_overall(&tags),
+        (TagPin::Prefix(p), _) => pick_latest_for_pin(&tags, p),
+    };
+
+    let Some(new_tag) = new_tag else {
+        return Ok(UpdateOutcome::Skipped(
+            "no matching SemVer release tag on remote".into(),
+        ));
+    };
+
+    if &new_tag == current_tag {
+        return Ok(UpdateOutcome::Skipped(format!("already at {new_tag}")));
+    }
+
+    Ok(UpdateOutcome::TagBumped {
+        old: current_tag.clone(),
+        new: new_tag,
+    })
 }
 
 // ── clean ─────────────────────────────────────────────────────────────────────
@@ -793,6 +1027,252 @@ mod tests {
     // ── update ────────────────────────────────────────────────────────────────
 
     #[test]
+    fn classify_tag_pin_full_semver_is_exact() {
+        assert_eq!(classify_tag_pin("v1.2.3"), Some(TagPin::Exact));
+        assert_eq!(classify_tag_pin("1.2.3"), Some(TagPin::Exact));
+        assert_eq!(classify_tag_pin("v0.1.0"), Some(TagPin::Exact));
+        assert_eq!(classify_tag_pin("1.0.0-rc1"), Some(TagPin::Exact));
+    }
+
+    #[test]
+    fn classify_tag_pin_partial_is_prefix() {
+        assert_eq!(classify_tag_pin("v1.0"), Some(TagPin::Prefix(vec![1, 0])));
+        assert_eq!(classify_tag_pin("v1"), Some(TagPin::Prefix(vec![1])));
+        assert_eq!(classify_tag_pin("2.5"), Some(TagPin::Prefix(vec![2, 5])));
+    }
+
+    #[test]
+    fn classify_tag_pin_non_semver_is_none() {
+        assert_eq!(classify_tag_pin("latest"), None);
+        assert_eq!(classify_tag_pin("release-candidate"), None);
+        assert_eq!(classify_tag_pin(""), None);
+    }
+
+    #[test]
+    fn pick_latest_for_pin_matches_prefix_max() {
+        let tags = vec![
+            "v1.0.0".to_string(),
+            "v1.0.1".to_string(),
+            "v1.0.5".to_string(),
+            "v1.1.0".to_string(),
+            "v2.0.0".to_string(),
+        ];
+        assert_eq!(
+            pick_latest_for_pin(&tags, &[1, 0]),
+            Some("v1.0.5".to_string())
+        );
+        assert_eq!(pick_latest_for_pin(&tags, &[1]), Some("v1.1.0".to_string()));
+        assert_eq!(pick_latest_for_pin(&tags, &[3]), None);
+    }
+
+    #[test]
+    fn pick_latest_for_pin_excludes_prerelease() {
+        let tags = vec![
+            "v1.0.0".to_string(),
+            "v1.0.1-rc1".to_string(),
+            "v1.0.1".to_string(),
+        ];
+        assert_eq!(
+            pick_latest_for_pin(&tags, &[1, 0]),
+            Some("v1.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_latest_for_pin_ignores_unrelated_tags() {
+        let tags = vec![
+            "v1.0.0".to_string(),
+            "release-2024".to_string(),
+            "v1.0.1".to_string(),
+        ];
+        assert_eq!(
+            pick_latest_for_pin(&tags, &[1, 0]),
+            Some("v1.0.1".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_latest_overall_takes_global_max() {
+        let tags = vec![
+            "v0.9.9".to_string(),
+            "v1.0.5".to_string(),
+            "v2.0.0".to_string(),
+            "v1.9.9".to_string(),
+        ];
+        assert_eq!(pick_latest_overall(&tags), Some("v2.0.0".to_string()));
+    }
+
+    #[test]
+    fn set_dep_tag_preserves_inline_layout() {
+        let toml = "[package]\nname = \"x\"\nversion = \"0.1.0\"\n\n\
+                    [deps]\nfoo = { git = \"https://example.com/foo\", tag = \"v1.0.0\" }\n";
+        let mut doc: toml_edit::DocumentMut = toml.parse().unwrap();
+        set_dep_tag(&mut doc, "foo", "v1.0.5").unwrap();
+        let out = doc.to_string();
+        assert!(
+            out.contains("tag = \"v1.0.5\""),
+            "new tag must be written:\n{out}"
+        );
+        assert!(
+            out.contains("git = \"https://example.com/foo\""),
+            "git URL preserved"
+        );
+    }
+
+    /// Add an annotated tag to HEAD of the repo at `dir`.
+    fn add_tag(dir: &Path, tag: &str) {
+        use git2::{Repository, Signature};
+        let repo = Repository::open(dir).unwrap();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        repo.tag(tag, head.as_object(), &sig, tag, false).unwrap();
+    }
+
+    #[test]
+    fn update_prefix_pin_bumps_to_latest_patch() {
+        let remote = TempDir::new().unwrap();
+        init_repo_with_commit(remote.path());
+        add_tag(remote.path(), "v1.0.0");
+        add_tag(remote.path(), "v1.0.1");
+        add_tag(remote.path(), "v1.0.5");
+        add_tag(remote.path(), "v1.1.0");
+
+        let project = TempDir::new().unwrap();
+        let manifest_path = project.path().join("mlua-pkg.toml");
+        let cache_dir = project.path().join(".mlua-pkgs/cache");
+        let vendored_dir = project.path().join(".mlua-pkgs/vendored");
+        let lock_path = project.path().join("mlua-pkg.lock");
+
+        let url = format!("file://{}", remote.path().display());
+        write_file(
+            &manifest_path,
+            &format!(
+                "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n\
+                 [deps]\nmylib = {{ git = \"{url}\", tag = \"v1.0\" }}\n"
+            ),
+        );
+
+        run_update(
+            None,
+            &manifest_path,
+            &cache_dir,
+            &vendored_dir,
+            &lock_path,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let updated = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            updated.contains("tag = \"v1.0.5\""),
+            "prefix pin v1.0 must bump to v1.0.5 (skipping v1.1.0):\n{updated}"
+        );
+    }
+
+    #[test]
+    fn update_dry_run_leaves_manifest_unmodified() {
+        let remote = TempDir::new().unwrap();
+        init_repo_with_commit(remote.path());
+        add_tag(remote.path(), "v1.0.0");
+        add_tag(remote.path(), "v1.0.5");
+
+        let project = TempDir::new().unwrap();
+        let manifest_path = project.path().join("mlua-pkg.toml");
+        let url = format!("file://{}", remote.path().display());
+        let original = format!(
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n\
+             [deps]\nmylib = {{ git = \"{url}\", tag = \"v1.0\" }}\n"
+        );
+        write_file(&manifest_path, &original);
+
+        run_update(
+            None,
+            &manifest_path,
+            &project.path().join(".mlua-pkgs/cache"),
+            &project.path().join(".mlua-pkgs/vendored"),
+            &project.path().join("mlua-pkg.lock"),
+            true,
+            false,
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(&manifest_path).unwrap();
+        assert_eq!(after, original, "dry-run must not modify manifest");
+    }
+
+    #[test]
+    fn update_exact_pin_without_force_is_noop() {
+        let remote = TempDir::new().unwrap();
+        init_repo_with_commit(remote.path());
+        add_tag(remote.path(), "v1.0.0");
+        add_tag(remote.path(), "v1.0.5");
+
+        let project = TempDir::new().unwrap();
+        let manifest_path = project.path().join("mlua-pkg.toml");
+        let url = format!("file://{}", remote.path().display());
+        let original = format!(
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n\
+             [deps]\nmylib = {{ git = \"{url}\", tag = \"v1.0.0\" }}\n"
+        );
+        write_file(&manifest_path, &original);
+
+        run_update(
+            None,
+            &manifest_path,
+            &project.path().join(".mlua-pkgs/cache"),
+            &project.path().join(".mlua-pkgs/vendored"),
+            &project.path().join("mlua-pkg.lock"),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            after.contains("tag = \"v1.0.0\""),
+            "exact pin must remain v1.0.0 without --force:\n{after}"
+        );
+    }
+
+    #[test]
+    fn update_exact_pin_with_force_bumps_to_latest() {
+        let remote = TempDir::new().unwrap();
+        init_repo_with_commit(remote.path());
+        add_tag(remote.path(), "v1.0.0");
+        add_tag(remote.path(), "v1.0.5");
+        add_tag(remote.path(), "v2.0.0");
+
+        let project = TempDir::new().unwrap();
+        let manifest_path = project.path().join("mlua-pkg.toml");
+        let url = format!("file://{}", remote.path().display());
+        write_file(
+            &manifest_path,
+            &format!(
+                "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n\
+                 [deps]\nmylib = {{ git = \"{url}\", tag = \"v1.0.0\" }}\n"
+            ),
+        );
+
+        run_update(
+            None,
+            &manifest_path,
+            &project.path().join(".mlua-pkgs/cache"),
+            &project.path().join(".mlua-pkgs/vendored"),
+            &project.path().join("mlua-pkg.lock"),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(
+            after.contains("tag = \"v2.0.0\""),
+            "--force must bump exact pin to global max v2.0.0:\n{after}"
+        );
+    }
+
+    #[test]
     fn update_unknown_name_returns_error() {
         let project = TempDir::new().unwrap();
         let manifest_path = project.path().join("mlua-pkg.toml");
@@ -808,6 +1288,8 @@ mod tests {
             &project.path().join("cache"),
             &project.path().join("vendored"),
             &project.path().join("mlua-pkg.lock"),
+            false,
+            false,
         );
         assert!(result.is_err(), "unknown dep name must return error");
     }

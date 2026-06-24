@@ -230,34 +230,72 @@ impl GitFetcher {
         Ok(())
     }
 
-    /// Build `FetchOptions` with the credential cascade callback.
-    fn make_fetch_options() -> FetchOptions<'static> {
+    /// List remote tag names by ls-remote (no clone).
+    ///
+    /// Connects to `url` in fetch direction, enumerates `refs/tags/*`, strips
+    /// the `refs/tags/` prefix and the `^{}` peeled-tag suffix when present,
+    /// and returns a de-duplicated `Vec<String>` in arbitrary order.
+    pub fn list_tags(&self, url: &str) -> Result<Vec<String>, PkgError> {
+        Self::validate_url(url)?;
+
+        // Transient repo in a temp dir to host the anonymous remote.
+        let scratch = self.cache_root.join("git").join(".ls-remote");
+        std::fs::create_dir_all(&scratch)?;
+        let tmp = Self::temp_clone_path(&scratch);
+        std::fs::create_dir_all(&tmp)?;
+
+        let result = Self::list_tags_inner(&tmp, url);
+        let _ = std::fs::remove_dir_all(&tmp);
+        result
+    }
+
+    fn list_tags_inner(tmp: &std::path::Path, url: &str) -> Result<Vec<String>, PkgError> {
+        let repo = Repository::init(tmp)?;
+        let mut remote = repo.remote_anonymous(url)?;
+        remote.connect_auth(
+            git2::Direction::Fetch,
+            Some(Self::make_credentials_callbacks()),
+            None,
+        )?;
+        let refs = remote.list()?;
+
+        let mut tags: Vec<String> = Vec::new();
+        for head in refs.iter() {
+            if let Some(name) = head.name().strip_prefix("refs/tags/") {
+                let trimmed = name.trim_end_matches("^{}");
+                let s = trimmed.to_string();
+                if !tags.contains(&s) {
+                    tags.push(s);
+                }
+            }
+        }
+
+        let _ = remote.disconnect();
+        Ok(tags)
+    }
+
+    /// Build `RemoteCallbacks` with the credential cascade (extracted so both
+    /// `make_fetch_options` and `list_tags` can share it).
+    fn make_credentials_callbacks() -> RemoteCallbacks<'static> {
         let mut callbacks = RemoteCallbacks::new();
 
-        // Track which credential types we've already tried to avoid infinite loops.
-        // Bits: 0 = SSH_KEY, 1 = USER_PASS_PLAINTEXT, 2 = DEFAULT
         let tried = AtomicU8::new(0);
-
         callbacks.credentials(move |_url, username, allowed| {
             let tried_bits = tried.load(Ordering::Relaxed);
 
-            // 1. SSH agent
             if allowed.contains(CredentialType::SSH_KEY) && (tried_bits & 0b001 == 0) {
                 tried.fetch_or(0b001, Ordering::Relaxed);
                 let user = username.unwrap_or("git");
                 return git2::Cred::ssh_key_from_agent(user);
             }
 
-            // 2. Credential helper (HTTPS)
             if allowed.contains(CredentialType::USER_PASS_PLAINTEXT) && (tried_bits & 0b010 == 0) {
                 tried.fetch_or(0b010, Ordering::Relaxed);
                 if let Ok(cfg) = git2::Config::open_default() {
                     return git2::Cred::credential_helper(&cfg, _url, username);
                 }
-                // If we cannot open git config fall through to default cred.
             }
 
-            // 3. Default
             if tried_bits & 0b100 == 0 {
                 tried.fetch_or(0b100, Ordering::Relaxed);
                 return git2::Cred::default();
@@ -265,9 +303,13 @@ impl GitFetcher {
 
             Err(git2::Error::from_str("all credential types exhausted"))
         });
+        callbacks
+    }
 
+    /// Build `FetchOptions` with the credential cascade callback.
+    fn make_fetch_options() -> FetchOptions<'static> {
         let mut fo = FetchOptions::new();
-        fo.remote_callbacks(callbacks);
+        fo.remote_callbacks(Self::make_credentials_callbacks());
         fo
     }
 }

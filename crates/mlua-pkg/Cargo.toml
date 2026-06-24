@@ -29,10 +29,12 @@ cap-std = { version = "4", optional = true }
 clap = { version = "4", features = ["derive"] }
 git2 = "0.18"
 mlua = { version = "0.11", features = ["lua54", "vendored", "serialize"] }
+semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 toml = "0.8"
+toml_edit = "0.22"
 
 [dev-dependencies]
 cap-std = "4"
