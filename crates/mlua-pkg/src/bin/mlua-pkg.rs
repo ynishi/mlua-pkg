@@ -74,8 +74,22 @@ enum Cmd {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Strip the redundant `mlua-pkg` arg that Cargo injects when the binary is
+/// invoked as `cargo mlua-pkg ...` (Cargo dispatches `cargo <name> <args...>`
+/// to `cargo-<name>` with `<name>` re-added as `args[1]`).
+fn strip_cargo_subcommand<I>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut args: Vec<String> = args.into_iter().collect();
+    if args.get(1).map(String::as_str) == Some("mlua-pkg") {
+        args.remove(1);
+    }
+    args
+}
+
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(strip_cargo_subcommand(std::env::args()));
     match cli.cmd {
         Cmd::Install => run_install(
             Path::new("mlua-pkg.toml"),
@@ -799,5 +813,31 @@ mod tests {
     fn cli_debug_assert() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    // ── cargo subcommand arg strip ────────────────────────────────────────────
+
+    #[test]
+    fn strip_cargo_subcommand_drops_redundant_arg() {
+        let input = vec![
+            "cargo-mlua-pkg".to_string(),
+            "mlua-pkg".to_string(),
+            "install".to_string(),
+        ];
+        let out = strip_cargo_subcommand(input);
+        assert_eq!(out, vec!["cargo-mlua-pkg".to_string(), "install".to_string()]);
+    }
+
+    #[test]
+    fn strip_cargo_subcommand_leaves_standalone_invocation_alone() {
+        let input = vec!["mlua-pkg".to_string(), "install".to_string()];
+        let out = strip_cargo_subcommand(input);
+        assert_eq!(out, vec!["mlua-pkg".to_string(), "install".to_string()]);
+    }
+
+    #[test]
+    fn strip_cargo_subcommand_handles_empty() {
+        let out = strip_cargo_subcommand(Vec::<String>::new());
+        assert!(out.is_empty());
     }
 }

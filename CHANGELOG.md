@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symlinks.
 - `resolve_entry` — entry fallback chain: `src/` → `lua/` → repo root.
 - `mlua-pkg` CLI binary (`mlua-pkg install`, `add`, `update`, `clean`).
+- `cargo-mlua-pkg` binary — same CLI exposed as a Cargo subcommand.
+  `cargo install mlua-pkg` enables `cargo mlua-pkg install` in CI without
+  managing PATH explicitly. Both binaries share the same source.
 - Integration smoke tests in `tests/pkgmgr_smoke.rs` using local `file://`
   git fixtures (network-free by default; real GitHub test opt-in via
   `cargo test -- --ignored`).

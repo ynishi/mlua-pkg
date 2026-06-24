@@ -19,6 +19,10 @@ sandbox-cap-std = ["dep:cap-std"]
 name = "mlua-pkg"
 path = "src/bin/mlua-pkg.rs"
 
+[[bin]]
+name = "cargo-mlua-pkg"
+path = "src/bin/mlua-pkg.rs"
+
 [dependencies]
 anyhow = "1"
 cap-std = { version = "4", optional = true }
