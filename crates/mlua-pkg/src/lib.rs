@@ -159,8 +159,12 @@
 //! By separating construction-time and runtime errors at the type level,
 //! callers can choose the appropriate recovery strategy.
 
+pub mod error;
+pub mod manifest;
 pub mod resolvers;
 pub mod sandbox;
+
+pub use error::PkgError;
 
 use mlua::{Lua, Result, Value};
 use std::path::PathBuf;
