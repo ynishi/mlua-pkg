@@ -35,7 +35,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Fetch all packages listed in mlua-pkg.toml and write mlua-pkg.lock.
+    /// Fetch every dep in mlua-pkg.toml and write mlua-pkg.lock.
+    ///
+    /// Resolution per [deps.<name>]:
+    ///   tag = "v1.0.0"  exact pin, fetched literally
+    ///   tag = "v1.0"    prefix pin, resolves to the SemVer-max
+    ///                   matching release (excludes pre-releases)
+    ///   branch = "..."  remote branch HEAD
+    ///   rev = "..."     specific commit SHA
+    ///
+    /// Output per dep:
+    ///   default                 → relative symlink at
+    ///                              .mlua-pkgs/vendored/<name>
+    ///   target_dir = "<path>"   → physical copy of the entry into
+    ///                              <manifest_dir>/<path>/ (idempotent;
+    ///                              versionable in your git tree)
+    ///
+    /// The lockfile records the *resolved* concrete tag (e.g. v1.0.5 even
+    /// when the manifest says v1.0) so it is always clear which release is
+    /// installed.
+    #[command(verbatim_doc_comment)]
     Install,
 
     /// Add a new dependency to mlua-pkg.toml (run `install` afterwards to fetch).
@@ -61,14 +80,30 @@ enum Cmd {
         target_dir: Option<PathBuf>,
     },
 
-    /// Refresh deps: bump SemVer-prefix tag pins, refresh branch pins, re-install.
+    /// Refresh deps and bump tag pins as appropriate, then re-install.
+    ///
+    /// Per-pin behaviour:
+    ///   tag = "v1.0.0"  exact pin → skip (use --force to bump to the
+    ///                                SemVer-max release on the remote)
+    ///   tag = "v1.0"    prefix pin → refresh; resolves to the latest
+    ///                                v1.0.x and updates the lock. The
+    ///                                manifest is *not* rewritten, so the
+    ///                                prefix keeps auto-following future
+    ///                                patches.
+    ///   branch = "..."  refresh; re-install picks up new HEAD
+    ///   rev = "..."     skip
+    ///
+    /// With --dry-run the plan is printed but neither the manifest nor the
+    /// lockfile is modified.
+    #[command(verbatim_doc_comment)]
     Update {
         /// Package name to update.  When omitted, all deps are considered.
         name: Option<String>,
         /// Show planned changes without writing the manifest or running install.
         #[arg(long)]
         dry_run: bool,
-        /// Also bump exact (full SemVer) tag pins to the latest release.
+        /// Also bump exact (full SemVer) tag pins to the SemVer-max release
+        /// available on the remote.
         #[arg(long)]
         force: bool,
     },
@@ -148,6 +183,17 @@ fn main() -> anyhow::Result<()> {
 // ── install ───────────────────────────────────────────────────────────────────
 
 /// Core install logic — testable with explicit paths.
+///
+/// Reads `manifest_path`, fetches each `[deps.<name>]` entry via
+/// [`GitFetcher`] under `cache_dir`, places the dep into either
+/// `vendored_dir/<name>` (relative symlink, default) or
+/// `<manifest_dir>/<dep.target_dir>` (idempotent physical copy), and
+/// writes the resolved `(tag, sha)` pairs into `lock_path`.
+///
+/// Same-name conflicts within `[deps]` are rejected up front (defence in
+/// depth for future transitive resolution); prefix tag pins are resolved
+/// inside the fetcher, so this function does not see a difference between
+/// `tag = "v1.0"` and `tag = "v1.0.5"`.
 fn run_install(
     manifest_path: &Path,
     cache_dir: &Path,
@@ -255,6 +301,9 @@ fn copy_entry_into(src: &Path, dest: &Path) -> std::io::Result<()> {
     copy_dir_contents(src, dest)
 }
 
+/// Recursively copy every entry under `src` into `dest`, materialising
+/// symlinks into regular files / directories so the vendored output is
+/// self-contained and never depends on the cache layout.
 fn copy_dir_contents(src: &Path, dest: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -292,6 +341,13 @@ fn entry_rel_to_pkg(cache_path: &Path, entry_abs: &Path) -> PathBuf {
 
 // ── add ───────────────────────────────────────────────────────────────────────
 
+/// Core `add` logic — testable with explicit paths.
+///
+/// Inserts (or replaces) a `[deps.<name>]` entry in the manifest at
+/// `manifest_path`.  Performs no network I/O and never invokes the
+/// fetcher; callers run `mlua-pkg install` afterwards.  Synthesises a
+/// minimal `[package]` block if the manifest file does not yet exist.
+/// Mutual exclusivity of `tag` / `rev` / `branch` is enforced up front.
 #[allow(clippy::too_many_arguments)]
 fn run_add(
     manifest_path: &Path,
@@ -399,6 +455,25 @@ enum UpdateOutcome {
     Skipped(String),
 }
 
+/// Core `update` logic — testable with explicit paths.
+///
+/// Walks `[deps]` (or just `name` when `Some`), classifies each entry via
+/// [`update_dep`], prints a one-line plan per dep, and — unless
+/// `dry_run` — applies the changes:
+///
+/// - `TagBumped` (exact pin under `--force`): rewrite the manifest's
+///   `tag` value in place via [`set_dep_tag`], then re-install.
+/// - `PrefixResolved` (prefix pin): **do not** mutate the manifest; just
+///   re-install so the fetcher resolves the prefix afresh and the
+///   lockfile picks up the new concrete tag / SHA.
+/// - `Refresh` (branch / no pin): re-install only.
+/// - `Skipped`: no-op.
+///
+/// Manifest edits go through `toml_edit::DocumentMut` so comments,
+/// formatting, and key order survive a rewrite.  When the update touched
+/// the manifest the file is replaced atomically before `run_install` is
+/// invoked.
+#[allow(clippy::too_many_arguments)]
 fn run_update(
     name: Option<String>,
     manifest_path: &Path,
@@ -482,6 +557,23 @@ fn run_update(
     Ok(())
 }
 
+/// Decide what `mlua-pkg update` should do for a single dep.
+///
+/// Pure policy: lists remote tags via the fetcher when needed but does
+/// not write to disk.  Returns an [`UpdateOutcome`] for `run_update` to
+/// act on.
+///
+/// Decision table:
+///
+/// | dep pin              | `force` | outcome                                     |
+/// | -------------------- | ------- | ------------------------------------------- |
+/// | `rev = "..."`        | any     | `Skipped("rev pin")`                        |
+/// | `branch = "..."`     | any     | `Refresh`                                   |
+/// | `tag = "..."`, exact | `false` | `Skipped("exact tag pin …")`                |
+/// | `tag = "..."`, exact | `true`  | `TagBumped` (or `Skipped("already at …")`)  |
+/// | `tag = "..."`, prefix| any     | `PrefixResolved` (or `Skipped("no match")`) |
+/// | `tag = "..."`, junk  | any     | `Skipped("tag '…' is not SemVer")`          |
+/// | no pin               | any     | `Refresh`                                   |
 fn update_dep(
     name: &str,
     dep: &Dep,
@@ -553,6 +645,13 @@ fn update_dep(
 
 // ── clean ─────────────────────────────────────────────────────────────────────
 
+/// Core `clean` logic — testable with explicit paths.
+///
+/// With `all = true`, removes the entire `cache_dir` and returns.
+/// Otherwise reads the lockfile at `lock_path`, collects the set of
+/// in-use SHAs, and recursively deletes any 40-hex SHA directory under
+/// `<cache_dir>/git/` that is *not* in that set.  A missing lockfile is
+/// treated as a no-op rather than an error.
 fn run_clean(all: bool, cache_dir: &Path, lock_path: &Path) -> anyhow::Result<()> {
     if all {
         if cache_dir.exists() {
