@@ -73,6 +73,12 @@ pub struct FetchedPkg {
 
     /// The parsed `mlua-pkg.toml` found at `cache_path`, if present.
     pub manifest: Option<Manifest>,
+
+    /// The concrete tag name actually resolved.  Equals `dep.tag` for exact
+    /// pins; for prefix pins (e.g. `"v0.1"`) holds the picked release
+    /// (e.g. `"v0.1.0"`).  `None` when no tag pin was used (rev / branch /
+    /// HEAD resolution).
+    pub resolved_tag: Option<String>,
 }
 
 // ── GitFetcher ────────────────────────────────────────────────────────────────
@@ -195,29 +201,66 @@ impl GitFetcher {
         git_base.join(format!(".fetch-{pid}-{n}"))
     }
 
-    /// Resolve the git ref from `dep` to a full 40-char SHA.
+    /// Resolve the git ref from `dep` into `(sha, resolved_tag)`.
     ///
     /// Resolution order:
-    /// 1. `rev` — treated as a revspec; the commit it peels to is returned.
-    /// 2. `tag` — resolved via `refs/tags/<tag>` (peeled to commit).
-    /// 3. `branch` — resolved via `refs/remotes/origin/<branch>` (peeled to commit).
-    /// 4. No ref — `HEAD` (latest commit on default branch).
+    /// 1. `rev` — treated as a revspec; peels to commit. `resolved_tag` = None.
+    /// 2. `tag` — classified via [`crate::version::classify_tag_pin`]:
+    ///    - **Exact** / unparseable → resolved literally via `refs/tags/<tag>`.
+    ///    - **Prefix** (`"v1.0"` etc.) → enumerate local tags, pick the
+    ///      SemVer-max release that matches the prefix, resolve that.
     ///
-    /// The repository must already have been fetched (all refs present).
-    fn resolve_sha(repo: &Repository, dep: &Dep) -> Result<String, PkgError> {
-        let oid = if let Some(rev) = &dep.rev {
-            repo.revparse_single(rev)?.peel_to_commit()?.id()
-        } else if let Some(tag) = &dep.tag {
-            let refname = format!("refs/tags/{tag}");
-            repo.find_reference(&refname)?.peel_to_commit()?.id()
-        } else if let Some(branch) = &dep.branch {
+    ///    `resolved_tag` holds the literal tag name actually used.
+    /// 3. `branch` — `refs/remotes/origin/<branch>` (peeled). `resolved_tag` = None.
+    /// 4. No ref — `HEAD`. `resolved_tag` = None.
+    fn resolve_ref(repo: &Repository, dep: &Dep) -> Result<(String, Option<String>), PkgError> {
+        if let Some(rev) = &dep.rev {
+            let oid = repo.revparse_single(rev)?.peel_to_commit()?.id();
+            return Ok((oid.to_string(), None));
+        }
+        if let Some(tag) = &dep.tag {
+            let resolved = Self::resolve_tag_pin(repo, tag)?;
+            let refname = format!("refs/tags/{resolved}");
+            let oid = repo.find_reference(&refname)?.peel_to_commit()?.id();
+            return Ok((oid.to_string(), Some(resolved)));
+        }
+        if let Some(branch) = &dep.branch {
             let refname = format!("refs/remotes/origin/{branch}");
-            repo.find_reference(&refname)?.peel_to_commit()?.id()
-        } else {
-            // Default: HEAD
-            repo.head()?.peel_to_commit()?.id()
+            let oid = repo.find_reference(&refname)?.peel_to_commit()?.id();
+            return Ok((oid.to_string(), None));
+        }
+        // Default: HEAD.
+        let oid = repo.head()?.peel_to_commit()?.id();
+        Ok((oid.to_string(), None))
+    }
+
+    /// Resolve `tag` to a concrete local tag name in `repo`.
+    ///
+    /// For [`crate::version::TagPin::Exact`] (or unclassifiable) values the
+    /// input is returned verbatim — callers will hit `refs/tags/<tag>` and
+    /// see a NotFound error if the tag truly does not exist.  For
+    /// [`crate::version::TagPin::Prefix`] values the local tag list is
+    /// enumerated and the SemVer-max matching release is picked; pre-release
+    /// tags are skipped.  Returns [`PkgError::Validation`] when a prefix pin
+    /// has no matching release.
+    fn resolve_tag_pin(repo: &Repository, tag: &str) -> Result<String, PkgError> {
+        use crate::version::{classify_tag_pin, pick_latest_for_pin, TagPin};
+
+        let pin = classify_tag_pin(tag);
+        let prefix = match pin {
+            Some(TagPin::Prefix(p)) => p,
+            // Exact, or unparseable: use the literal value.
+            _ => return Ok(tag.to_string()),
         };
-        Ok(oid.to_string())
+
+        let tag_names = repo.tag_names(None)?;
+        let local_tags: Vec<String> = tag_names
+            .iter()
+            .filter_map(|t| t.map(|s| s.to_string()))
+            .collect();
+        pick_latest_for_pin(&local_tags, &prefix).ok_or_else(|| PkgError::Validation {
+            message: format!("tag prefix '{tag}' has no matching SemVer release on remote"),
+        })
     }
 
     /// Reset the worktree of `repo` hard to the commit named by `sha`.
@@ -340,8 +383,8 @@ impl Fetcher for GitFetcher {
             }
         };
 
-        // ── Resolve SHA ──────────────────────────────────────────────────────
-        let sha = match Self::resolve_sha(&repo, dep) {
+        // ── Resolve SHA + concrete tag ───────────────────────────────────────
+        let (sha, resolved_tag) = match Self::resolve_ref(&repo, dep) {
             Ok(s) => s,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&tmp_path);
@@ -393,6 +436,7 @@ impl Fetcher for GitFetcher {
             cache_path,
             sha,
             manifest,
+            resolved_tag,
         })
     }
 }

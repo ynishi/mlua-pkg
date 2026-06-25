@@ -220,10 +220,13 @@ fn run_install(
         // Compute entry relative to the package cache root for the lockfile.
         let entry = entry_rel_to_pkg(&fetched.cache_path, &entry_abs);
 
+        // Record the *resolved* tag in the lockfile (concrete release for
+        // prefix pins; falls back to whatever the manifest declared).
+        let locked_tag = fetched.resolved_tag.clone().or_else(|| dep.tag.clone());
         locked_pkgs.push(LockedPkg {
             name: name.clone(),
             source: format!("git+{}", dep.git),
-            tag: dep.tag.clone(),
+            tag: locked_tag,
             rev: dep.rev.clone(),
             branch: dep.branch.clone(),
             sha: fetched.sha,
@@ -361,91 +364,7 @@ fn run_add(
 
 // ── update ────────────────────────────────────────────────────────────────────
 
-/// Classification of a `[deps.<name>] tag = "..."` value.
-#[derive(Debug, PartialEq, Eq)]
-enum TagPin {
-    /// Full SemVer (X.Y.Z), optionally with pre-release. `update` leaves it
-    /// alone unless `--force` is passed.
-    Exact,
-    /// Partial SemVer (e.g. "v1.0", "v1") interpreted as a prefix that
-    /// auto-follows the latest matching release.  The numeric components are
-    /// returned in left-to-right order.
-    Prefix(Vec<u64>),
-}
-
-/// Strip a leading `v`/`V` from a tag string.
-fn strip_v_prefix(s: &str) -> &str {
-    s.strip_prefix('v')
-        .or_else(|| s.strip_prefix('V'))
-        .unwrap_or(s)
-}
-
-/// Classify the manifest `tag` field into [`TagPin::Exact`] or
-/// [`TagPin::Prefix`].  Returns `None` for unparseable values
-/// (e.g. `"latest"`, `"feature-branch"`); such pins are skipped on update.
-fn classify_tag_pin(tag: &str) -> Option<TagPin> {
-    let stripped = strip_v_prefix(tag);
-    if semver::Version::parse(stripped).is_ok() {
-        return Some(TagPin::Exact);
-    }
-    let parts: Option<Vec<u64>> = stripped.split('.').map(|s| s.parse::<u64>().ok()).collect();
-    let parts = parts?;
-    if parts.is_empty() || parts.len() >= 3 {
-        return None;
-    }
-    Some(TagPin::Prefix(parts))
-}
-
-/// Pick the SemVer-max tag from `tags` whose components match `pin`'s prefix.
-/// Pre-release tags (e.g. `v1.0.0-rc1`) are excluded.
-///
-/// Returns the original (un-stripped) tag string so the manifest can be
-/// rewritten verbatim.
-fn pick_latest_for_pin(tags: &[String], pin: &[u64]) -> Option<String> {
-    let mut best: Option<(semver::Version, &String)> = None;
-    for tag in tags {
-        let stripped = strip_v_prefix(tag);
-        let Ok(ver) = semver::Version::parse(stripped) else {
-            continue;
-        };
-        if !ver.pre.is_empty() {
-            continue;
-        }
-        let comps = [ver.major, ver.minor, ver.patch];
-        if pin.iter().zip(comps.iter()).any(|(p, c)| p != c) {
-            continue;
-        }
-        if pin.len() > comps.len() {
-            continue;
-        }
-        match &best {
-            None => best = Some((ver, tag)),
-            Some((b, _)) if &ver > b => best = Some((ver, tag)),
-            _ => {}
-        }
-    }
-    best.map(|(_, t)| t.clone())
-}
-
-/// Pick the SemVer-max release tag (used for `--force` on exact pins).
-fn pick_latest_overall(tags: &[String]) -> Option<String> {
-    let mut best: Option<(semver::Version, &String)> = None;
-    for tag in tags {
-        let stripped = strip_v_prefix(tag);
-        let Ok(ver) = semver::Version::parse(stripped) else {
-            continue;
-        };
-        if !ver.pre.is_empty() {
-            continue;
-        }
-        match &best {
-            None => best = Some((ver, tag)),
-            Some((b, _)) if &ver > b => best = Some((ver, tag)),
-            _ => {}
-        }
-    }
-    best.map(|(_, t)| t.clone())
-}
+use mlua_pkg::version::{classify_tag_pin, pick_latest_for_pin, pick_latest_overall, TagPin};
 
 /// Rewrite the `tag` value for `[deps.<name>]` in `doc`, preserving formatting.
 fn set_dep_tag(doc: &mut toml_edit::DocumentMut, name: &str, new_tag: &str) -> anyhow::Result<()> {
@@ -467,8 +386,13 @@ fn set_dep_tag(doc: &mut toml_edit::DocumentMut, name: &str, new_tag: &str) -> a
 /// Per-dep update outcome.
 #[derive(Debug)]
 enum UpdateOutcome {
-    /// Tag rewritten from `old` to `new` (manifest is mutated).
+    /// Exact tag pin rewritten from `old` to `new` (manifest is mutated;
+    /// only emitted under `--force`).
     TagBumped { old: String, new: String },
+    /// Prefix tag pin re-resolves to a concrete release.  The manifest is
+    /// **not** mutated — the prefix stays so it keeps auto-following future
+    /// patches.  `resolved` is shown in dry-run output for transparency.
+    PrefixResolved { pin: String, resolved: String },
     /// Branch / no-pin dep: just re-install so lock picks up new HEAD.
     Refresh,
     /// Skipped (rev pin, exact tag without --force, unparseable tag, no remote match).
@@ -518,6 +442,12 @@ fn run_update(
                 if !dry_run {
                     set_dep_tag(&mut doc, dep_name, new)?;
                 }
+                any_refresh = true;
+            }
+            UpdateOutcome::PrefixResolved { pin, resolved } => {
+                summary.push(format!(
+                    "{dep_name}: refresh (prefix '{pin}' → {resolved}; manifest unchanged)"
+                ));
                 any_refresh = true;
             }
             UpdateOutcome::Refresh => {
@@ -577,34 +507,48 @@ fn update_dep(
         }
     };
 
+    // Exact pin without --force: nothing to do (without listing remote tags).
+    if matches!(pin, TagPin::Exact) && !force {
+        return Ok(UpdateOutcome::Skipped(
+            "exact tag pin (pass --force to bump)".into(),
+        ));
+    }
+
     let tags = fetcher
         .list_tags(&dep.git)
         .with_context(|| format!("listing tags for '{name}'"))?;
 
-    let new_tag = match (&pin, force) {
-        (TagPin::Exact, false) => {
-            return Ok(UpdateOutcome::Skipped(
-                "exact tag pin (pass --force to bump)".into(),
-            ))
+    match pin {
+        TagPin::Exact => {
+            // --force path: bump to the SemVer-max release on the remote.
+            let Some(new_tag) = pick_latest_overall(&tags) else {
+                return Ok(UpdateOutcome::Skipped(
+                    "no matching SemVer release tag on remote".into(),
+                ));
+            };
+            if &new_tag == current_tag {
+                Ok(UpdateOutcome::Skipped(format!("already at {new_tag}")))
+            } else {
+                Ok(UpdateOutcome::TagBumped {
+                    old: current_tag.clone(),
+                    new: new_tag,
+                })
+            }
         }
-        (TagPin::Exact, true) => pick_latest_overall(&tags),
-        (TagPin::Prefix(p), _) => pick_latest_for_pin(&tags, p),
-    };
-
-    let Some(new_tag) = new_tag else {
-        return Ok(UpdateOutcome::Skipped(
-            "no matching SemVer release tag on remote".into(),
-        ));
-    };
-
-    if &new_tag == current_tag {
-        return Ok(UpdateOutcome::Skipped(format!("already at {new_tag}")));
+        TagPin::Prefix(p) => {
+            // Prefix pin: resolve to a concrete tag but leave the manifest
+            // untouched so the prefix keeps auto-following future patches.
+            let Some(resolved) = pick_latest_for_pin(&tags, &p) else {
+                return Ok(UpdateOutcome::Skipped(
+                    "no matching SemVer release tag on remote".into(),
+                ));
+            };
+            Ok(UpdateOutcome::PrefixResolved {
+                pin: current_tag.clone(),
+                resolved,
+            })
+        }
     }
-
-    Ok(UpdateOutcome::TagBumped {
-        old: current_tag.clone(),
-        new: new_tag,
-    })
 }
 
 // ── clean ─────────────────────────────────────────────────────────────────────
@@ -1025,82 +969,9 @@ mod tests {
     }
 
     // ── update ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn classify_tag_pin_full_semver_is_exact() {
-        assert_eq!(classify_tag_pin("v1.2.3"), Some(TagPin::Exact));
-        assert_eq!(classify_tag_pin("1.2.3"), Some(TagPin::Exact));
-        assert_eq!(classify_tag_pin("v0.1.0"), Some(TagPin::Exact));
-        assert_eq!(classify_tag_pin("1.0.0-rc1"), Some(TagPin::Exact));
-    }
-
-    #[test]
-    fn classify_tag_pin_partial_is_prefix() {
-        assert_eq!(classify_tag_pin("v1.0"), Some(TagPin::Prefix(vec![1, 0])));
-        assert_eq!(classify_tag_pin("v1"), Some(TagPin::Prefix(vec![1])));
-        assert_eq!(classify_tag_pin("2.5"), Some(TagPin::Prefix(vec![2, 5])));
-    }
-
-    #[test]
-    fn classify_tag_pin_non_semver_is_none() {
-        assert_eq!(classify_tag_pin("latest"), None);
-        assert_eq!(classify_tag_pin("release-candidate"), None);
-        assert_eq!(classify_tag_pin(""), None);
-    }
-
-    #[test]
-    fn pick_latest_for_pin_matches_prefix_max() {
-        let tags = vec![
-            "v1.0.0".to_string(),
-            "v1.0.1".to_string(),
-            "v1.0.5".to_string(),
-            "v1.1.0".to_string(),
-            "v2.0.0".to_string(),
-        ];
-        assert_eq!(
-            pick_latest_for_pin(&tags, &[1, 0]),
-            Some("v1.0.5".to_string())
-        );
-        assert_eq!(pick_latest_for_pin(&tags, &[1]), Some("v1.1.0".to_string()));
-        assert_eq!(pick_latest_for_pin(&tags, &[3]), None);
-    }
-
-    #[test]
-    fn pick_latest_for_pin_excludes_prerelease() {
-        let tags = vec![
-            "v1.0.0".to_string(),
-            "v1.0.1-rc1".to_string(),
-            "v1.0.1".to_string(),
-        ];
-        assert_eq!(
-            pick_latest_for_pin(&tags, &[1, 0]),
-            Some("v1.0.1".to_string())
-        );
-    }
-
-    #[test]
-    fn pick_latest_for_pin_ignores_unrelated_tags() {
-        let tags = vec![
-            "v1.0.0".to_string(),
-            "release-2024".to_string(),
-            "v1.0.1".to_string(),
-        ];
-        assert_eq!(
-            pick_latest_for_pin(&tags, &[1, 0]),
-            Some("v1.0.1".to_string())
-        );
-    }
-
-    #[test]
-    fn pick_latest_overall_takes_global_max() {
-        let tags = vec![
-            "v0.9.9".to_string(),
-            "v1.0.5".to_string(),
-            "v2.0.0".to_string(),
-            "v1.9.9".to_string(),
-        ];
-        assert_eq!(pick_latest_overall(&tags), Some("v2.0.0".to_string()));
-    }
+    // Pure helpers (classify_tag_pin / pick_latest_*) are covered in
+    // mlua_pkg::version unit tests.  The cases here exercise CLI-level
+    // wiring: lock + manifest mutation behaviour around run_update.
 
     #[test]
     fn set_dep_tag_preserves_inline_layout() {
@@ -1129,13 +1000,62 @@ mod tests {
     }
 
     #[test]
-    fn update_prefix_pin_bumps_to_latest_patch() {
+    fn update_prefix_pin_refreshes_lock_without_mutating_manifest() {
         let remote = TempDir::new().unwrap();
         init_repo_with_commit(remote.path());
         add_tag(remote.path(), "v1.0.0");
         add_tag(remote.path(), "v1.0.1");
         add_tag(remote.path(), "v1.0.5");
         add_tag(remote.path(), "v1.1.0");
+
+        let project = TempDir::new().unwrap();
+        let manifest_path = project.path().join("mlua-pkg.toml");
+        let cache_dir = project.path().join(".mlua-pkgs/cache");
+        let vendored_dir = project.path().join(".mlua-pkgs/vendored");
+        let lock_path = project.path().join("mlua-pkg.lock");
+
+        let url = format!("file://{}", remote.path().display());
+        let original = format!(
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n\
+             [deps]\nmylib = {{ git = \"{url}\", tag = \"v1.0\" }}\n"
+        );
+        write_file(&manifest_path, &original);
+
+        run_update(
+            None,
+            &manifest_path,
+            &cache_dir,
+            &vendored_dir,
+            &lock_path,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // Manifest stays as the prefix — auto-follow intent is preserved.
+        let after = std::fs::read_to_string(&manifest_path).unwrap();
+        assert_eq!(
+            after, original,
+            "prefix pin manifest must not be rewritten:\n{after}"
+        );
+
+        // Lockfile records the resolved concrete tag (v1.0.5, not v1.1.0).
+        let lf = Lockfile::read(&lock_path).unwrap();
+        assert_eq!(lf.pkg.len(), 1, "one locked package");
+        assert_eq!(
+            lf.pkg[0].tag.as_deref(),
+            Some("v1.0.5"),
+            "lock must record resolved concrete tag"
+        );
+    }
+
+    #[test]
+    fn install_with_prefix_pin_resolves_to_concrete_tag() {
+        let remote = TempDir::new().unwrap();
+        init_repo_with_commit(remote.path());
+        add_tag(remote.path(), "v1.0.0");
+        add_tag(remote.path(), "v1.0.5");
+        add_tag(remote.path(), "v2.0.0");
 
         let project = TempDir::new().unwrap();
         let manifest_path = project.path().join("mlua-pkg.toml");
@@ -1152,21 +1072,13 @@ mod tests {
             ),
         );
 
-        run_update(
-            None,
-            &manifest_path,
-            &cache_dir,
-            &vendored_dir,
-            &lock_path,
-            false,
-            false,
-        )
-        .unwrap();
+        run_install(&manifest_path, &cache_dir, &vendored_dir, &lock_path).unwrap();
 
-        let updated = std::fs::read_to_string(&manifest_path).unwrap();
-        assert!(
-            updated.contains("tag = \"v1.0.5\""),
-            "prefix pin v1.0 must bump to v1.0.5 (skipping v1.1.0):\n{updated}"
+        let lf = Lockfile::read(&lock_path).unwrap();
+        assert_eq!(
+            lf.pkg[0].tag.as_deref(),
+            Some("v1.0.5"),
+            "install must resolve prefix v1.0 to concrete v1.0.5 (excluding v2.0.0):\n{lf:?}"
         );
     }
 

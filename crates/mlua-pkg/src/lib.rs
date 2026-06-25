@@ -165,6 +165,7 @@ pub mod lockfile;
 pub mod manifest;
 pub mod resolvers;
 pub mod sandbox;
+pub mod version;
 
 pub use error::PkgError;
 
