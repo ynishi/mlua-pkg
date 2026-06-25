@@ -211,8 +211,22 @@ mlua-pkg install
 
 Fetches every dep in `mlua-pkg.toml`, resolves prefix tag pins to a concrete
 release, writes `mlua-pkg.lock` with pinned SHAs, and either symlinks each
-dep under `.mlua-pkgs/vendored/<name>` (default) or copies the entry
+dep under `<mlua-pkgs-dir>/vendored/<name>` (default) or copies the entry
 contents into the per-dep `target_dir` when one is set.
+
+#### Where the cache lives
+
+`mlua-pkg` picks the base directory in this order:
+
+1. `--mlua-pkgs-dir <PATH>` (global flag, applies to every subcommand).
+2. `MLUA_PKG_DIR` env variable.
+3. `target/mlua-pkgs/` when a `target/` directory exists in the cwd —
+   typical for Rust crates that vendor Lua deps.  This keeps the cache out
+   of the git tree (cargo unconditionally ignores `target/`) and prevents
+   `cargo publish`'s VCS walker from descending into the nested git clones
+   under `cache/` and aborting with "uncommitted changes".
+4. `.mlua-pkgs/` fallback (legacy default) — add this entry to `.gitignore`
+   if you keep it.
 
 ### Refresh deps (`mlua-pkg update`)
 

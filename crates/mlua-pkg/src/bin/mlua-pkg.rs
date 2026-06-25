@@ -29,8 +29,38 @@ use mlua_pkg::{
     author
 )]
 struct Cli {
+    /// Base directory for cache + vendored output.
+    ///
+    /// Resolution order: this flag > `MLUA_PKG_DIR` env > auto-detect.
+    /// Auto-detect picks `target/mlua-pkgs` when a `target/` directory
+    /// exists in the current working directory (so Rust crates avoid
+    /// littering the workspace and `cargo publish`'s VCS walker skips it),
+    /// otherwise falls back to `.mlua-pkgs`.
+    #[arg(long, global = true, value_name = "PATH")]
+    mlua_pkgs_dir: Option<PathBuf>,
+
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// Resolve the base `.mlua-pkgs` directory.
+///
+/// Priority: explicit `--mlua-pkgs-dir` flag > `MLUA_PKG_DIR` env >
+/// `target/mlua-pkgs` when `target/` exists > `.mlua-pkgs` fallback.
+fn resolve_mlua_pkgs_dir(flag: Option<&Path>) -> PathBuf {
+    if let Some(p) = flag {
+        return p.to_path_buf();
+    }
+    if let Ok(p) = std::env::var("MLUA_PKG_DIR") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    if Path::new("target").is_dir() {
+        PathBuf::from("target/mlua-pkgs")
+    } else {
+        PathBuf::from(".mlua-pkgs")
+    }
 }
 
 #[derive(Subcommand)]
@@ -134,11 +164,14 @@ where
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse_from(strip_cargo_subcommand(std::env::args()));
+    let base = resolve_mlua_pkgs_dir(cli.mlua_pkgs_dir.as_deref());
+    let cache_dir = base.join("cache");
+    let vendored_dir = base.join("vendored");
     match cli.cmd {
         Cmd::Install => run_install(
             Path::new("mlua-pkg.toml"),
-            Path::new(".mlua-pkgs/cache"),
-            Path::new(".mlua-pkgs/vendored"),
+            &cache_dir,
+            &vendored_dir,
             Path::new("mlua-pkg.lock"),
         ),
         Cmd::Add {
@@ -166,17 +199,13 @@ fn main() -> anyhow::Result<()> {
         } => run_update(
             name,
             Path::new("mlua-pkg.toml"),
-            Path::new(".mlua-pkgs/cache"),
-            Path::new(".mlua-pkgs/vendored"),
+            &cache_dir,
+            &vendored_dir,
             Path::new("mlua-pkg.lock"),
             dry_run,
             force,
         ),
-        Cmd::Clean { all } => run_clean(
-            all,
-            Path::new(".mlua-pkgs/cache"),
-            Path::new("mlua-pkg.lock"),
-        ),
+        Cmd::Clean { all } => run_clean(all, &cache_dir, Path::new("mlua-pkg.lock")),
     }
 }
 
@@ -1462,6 +1491,40 @@ mod tests {
         let input = vec!["mlua-pkg".to_string(), "install".to_string()];
         let out = strip_cargo_subcommand(input);
         assert_eq!(out, vec!["mlua-pkg".to_string(), "install".to_string()]);
+    }
+
+    // ── resolve_mlua_pkgs_dir ─────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_mlua_pkgs_dir_explicit_flag_wins() {
+        let p = PathBuf::from("/some/custom/path");
+        assert_eq!(resolve_mlua_pkgs_dir(Some(&p)), p);
+    }
+
+    #[test]
+    fn resolve_mlua_pkgs_dir_auto_detect_target() {
+        // Verify auto-detect honours the cwd: when target/ exists pick it,
+        // otherwise fall back to .mlua-pkgs.  Run in an isolated TempDir to
+        // avoid clobbering whatever the test runner's cwd looked like.
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        // Clear env to take the env branch out of the picture.
+        let saved_env = std::env::var("MLUA_PKG_DIR").ok();
+        std::env::remove_var("MLUA_PKG_DIR");
+
+        std::env::set_current_dir(tmp.path()).unwrap();
+        assert_eq!(resolve_mlua_pkgs_dir(None), PathBuf::from(".mlua-pkgs"));
+
+        std::fs::create_dir(tmp.path().join("target")).unwrap();
+        assert_eq!(
+            resolve_mlua_pkgs_dir(None),
+            PathBuf::from("target/mlua-pkgs")
+        );
+
+        std::env::set_current_dir(prev).unwrap();
+        if let Some(v) = saved_env {
+            std::env::set_var("MLUA_PKG_DIR", v);
+        }
     }
 
     #[test]

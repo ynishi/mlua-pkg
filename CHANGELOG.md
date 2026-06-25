@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-25
+
+### Added
+
+- **Configurable `.mlua-pkgs` base directory.**  New global flag
+  `--mlua-pkgs-dir <PATH>` and env var `MLUA_PKG_DIR` move cache + vendored
+  output off the manifest root.  Resolution order: flag > env > auto.
+  Auto-detect picks `target/mlua-pkgs` when a `target/` directory exists in
+  the current working directory, otherwise falls back to the previous
+  `.mlua-pkgs` default.
+
+### Fixed
+
+- **`cargo publish` no longer trips on the package cache.**  Cached git
+  clones under `.mlua-pkgs/cache/` are nested git repositories, and cargo's
+  VCS walker descends into them and flags upstream working-tree files as
+  uncommitted — aborting `cargo publish` even when `.mlua-pkgs` is in
+  `.gitignore` and excluded from the crate's `include` list.  With the new
+  auto-detected `target/mlua-pkgs/` location cargo skips the cache entirely
+  (cargo unconditionally ignores `target/`), removing the need for
+  `--allow-dirty`.
+
 ## [0.5.0] - 2026-06-25
 
 ### Added
