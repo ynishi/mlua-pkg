@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-25
+
+### Added
+
+- **Per-dep `target_dir` (physical vendoring).**  When a manifest entry sets
+  `target_dir = "<rel/path>"`, `mlua-pkg install` copies the resolved entry
+  contents into that directory (manifest-relative) instead of creating the
+  default `.mlua-pkgs/vendored/<name>` symlink.  Vendored output is
+  versionable in the consumer's git tree and is removed + re-populated on
+  each run (idempotent).  `mlua-pkg add --target-dir=<path>` writes the
+  field for new deps.
+- **`mlua-pkg update`** — refresh deps and bump tag pins.  Pin semantics:
+  - `tag = "v1.0"` / `"v1"` (prefix) — interpreted as a SemVer range.  Both
+    `install` and `update` resolve the prefix to the SemVer-max matching
+    release on the remote (pre-release tags excluded).  The manifest stays
+    as the prefix; only the lockfile records the concrete tag, so the pin
+    keeps auto-following future patches.
+  - `tag = "v1.0.0"` (full SemVer) — exact pin.  `update` leaves it alone
+    by default; `--force` bumps to the SemVer-max release overall.
+  - `branch = "..."` — refresh only (lock picks up new HEAD on re-install).
+  - `rev = "..."` — skipped.
+  - `--dry-run` prints the plan without writing the manifest or running
+    install.
+- **Lockfile records the resolved concrete tag.**  Prefix pins write the
+  picked release (e.g. `tag = "v1.0.5"`) rather than the prefix string, so
+  it is always clear which version is currently installed.
+- New `mlua_pkg::version` module exposing `TagPin`, `classify_tag_pin`,
+  `pick_latest_for_pin`, and `pick_latest_overall` for reuse.
+
+### Changed
+
+- `FetchedPkg` gains `resolved_tag: Option<String>` — the concrete tag name
+  actually checked out (equals the manifest `tag` for exact pins, the
+  picked release for prefix pins, `None` for rev / branch / HEAD).
+
 ## [0.4.1] - 2026-06-25
 
 ### Fixed

@@ -188,7 +188,19 @@ name = "my-project"
 version = "0.1.0"
 
 [deps]
+# Exact pin — never moves unless --force.
 lshape = { git = "https://github.com/ynishi/lshape", tag = "v0.1.0" }
+
+# Prefix pin — auto-follows the latest matching SemVer release
+# (here: latest v0.1.x, not v0.2.x).  Manifest stays as "v0.1";
+# the resolved tag is recorded in mlua-pkg.lock.
+lshape = { git = "https://github.com/ynishi/lshape", tag = "v0.1" }
+
+# Physical vendoring — copy the entry into a manifest-relative
+# directory you can commit to git, instead of symlinking under
+# .mlua-pkgs/vendored/.
+lshape = { git = "https://github.com/ynishi/lshape", tag = "v0.2",
+           entry = "lshape", target_dir = "lua/lshape" }
 ```
 
 ### Install via CLI
@@ -197,8 +209,27 @@ lshape = { git = "https://github.com/ynishi/lshape", tag = "v0.1.0" }
 mlua-pkg install
 ```
 
-This fetches all packages declared in `mlua-pkg.toml`, writes `mlua-pkg.lock`
-with pinned SHAs, and creates symlinks under `.mlua-pkgs/vendored/`.
+Fetches every dep in `mlua-pkg.toml`, resolves prefix tag pins to a concrete
+release, writes `mlua-pkg.lock` with pinned SHAs, and either symlinks each
+dep under `.mlua-pkgs/vendored/<name>` (default) or copies the entry
+contents into the per-dep `target_dir` when one is set.
+
+### Refresh deps (`mlua-pkg update`)
+
+```sh
+mlua-pkg update              # bump prefix pins, refresh branch pins
+mlua-pkg update --dry-run    # print the plan, do not modify anything
+mlua-pkg update --force      # also bump exact pins to the SemVer-max release
+```
+
+Per-pin behaviour:
+
+| pin form          | `update` (no flag)                                       | `update --force`            |
+| ----------------- | -------------------------------------------------------- | --------------------------- |
+| `tag = "v1.0.0"`  | skip (use `--force` to bump)                             | bump to SemVer-max release  |
+| `tag = "v1.0"`    | refresh — resolves to latest `v1.0.x`, manifest unchanged | (same)                     |
+| `branch = "..."`  | refresh — re-install picks up new HEAD                   | (same)                     |
+| `rev = "..."`     | skip                                                     | (same)                     |
 
 ### Use in Rust
 
