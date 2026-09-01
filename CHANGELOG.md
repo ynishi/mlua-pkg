@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.7.0] - 2026-09-01
+
+### Added
+
 - **`FsResolver::new_symlink_aware` / `AssetResolver::new_symlink_aware`.**
   `SymlinkAwareSandbox` already existed but was only reachable through
   `with_sandbox` or `VendoredResolver`, so consumers rooting a resolver at a
