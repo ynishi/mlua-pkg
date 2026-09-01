@@ -60,7 +60,7 @@ pub struct Package {
     /// Entry root for Lua `require` resolution.
     ///
     /// Used by author-side manifests.  When absent, the fallback chain
-    /// (`src/` → `lua/` → repo root) is applied at install time (ST4).
+    /// (`src/` → `lua/` → repo root) is applied at install time.
     pub entry: Option<PathBuf>,
 }
 
@@ -70,7 +70,7 @@ pub struct Package {
 ///
 /// At most one of `tag`, `rev`, or `branch` may be set.  All three being
 /// absent is accepted at parse time (treated as HEAD resolution); hard
-/// enforcement is deferred to the fetcher (ST3).
+/// enforcement is deferred to the fetcher.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Dep {

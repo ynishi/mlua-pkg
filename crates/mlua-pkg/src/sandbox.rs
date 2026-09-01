@@ -191,15 +191,32 @@ impl SandboxedFs for FsSandbox {
 /// a file is permitted if its canonical path is under the root **or**
 /// under any of the recorded symlink targets.
 ///
+/// If both checks fail, the root is rescanned once before the read is
+/// rejected, so symlinks created *after* construction (e.g. a later
+/// `mlua-pkg install` in a long-running host) are picked up without
+/// rebuilding the sandbox. The rescan runs only on the path that would
+/// otherwise return [`ReadError::Traversal`]; successful reads never
+/// touch the filesystem beyond the file itself.
+///
+/// Rejection is therefore no longer free: it costs one `read_dir` plus a
+/// `canonicalize` per root entry. Reads that miss because the file does not
+/// exist are unaffected (they return `Ok(None)` before the boundary check),
+/// so the cost falls only on names that resolve to a real file outside the
+/// root — which then fail anyway.
+///
 /// # Security boundary
 ///
 /// Same as [`FsSandbox`]: casual escape prevention for trusted directories.
-/// The allowed target set is fixed at construction time; symlinks added
-/// after construction are not recognized until a new instance is created.
+/// Note that the rescan widens the allowed set to whatever symlinks exist
+/// under the root at read time — the root directory itself must stay
+/// trusted.
 pub struct SymlinkAwareSandbox {
     root: PathBuf,
-    /// Canonical paths of symlink targets found under root at construction time.
-    allowed_targets: Vec<PathBuf>,
+    /// Canonical paths of symlink targets found under root.
+    ///
+    /// Seeded at construction and refreshed lazily when a read would
+    /// otherwise be rejected as a traversal.
+    allowed_targets: std::sync::RwLock<Vec<PathBuf>>,
 }
 
 impl SymlinkAwareSandbox {
@@ -218,26 +235,67 @@ impl SymlinkAwareSandbox {
             }
         };
 
-        let mut allowed_targets = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(&canonical) {
-            for entry in entries.flatten() {
-                let meta = match entry.path().symlink_metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                if meta.file_type().is_symlink() {
-                    if let Ok(target) = entry.path().canonicalize() {
-                        allowed_targets.push(target);
-                    }
-                }
-            }
-        }
+        let allowed_targets = scan_symlink_targets(&canonical).unwrap_or_default();
 
         Ok(Self {
             root: canonical,
-            allowed_targets,
+            allowed_targets: std::sync::RwLock::new(allowed_targets),
         })
     }
+
+    /// Check `canonical` against the currently cached symlink targets.
+    fn is_allowed(&self, canonical: &Path) -> bool {
+        let targets = self
+            .allowed_targets
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        targets.iter().any(|t| canonical.starts_with(t))
+    }
+
+    /// Rescan the root and re-check `canonical` against the refreshed set.
+    ///
+    /// Called only when [`is_allowed`](Self::is_allowed) already failed, so
+    /// the `read_dir` cost is confined to the would-be-error path.
+    ///
+    /// A scan that fails outright (unreadable root) leaves the cached set
+    /// untouched: "the root could not be listed" must not be recorded as
+    /// "the root has no symlinks", which would drop known-good targets and
+    /// turn a transient I/O problem into a permanent traversal rejection.
+    fn rescan_and_check(&self, canonical: &Path) -> bool {
+        let Some(fresh) = scan_symlink_targets(&self.root) else {
+            return false;
+        };
+        let allowed = fresh.iter().any(|t| canonical.starts_with(t));
+        let mut targets = self
+            .allowed_targets
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *targets = fresh;
+        allowed
+    }
+}
+
+/// Collect canonical targets of symlinks located directly under `root`.
+///
+/// Returns `None` if `root` itself could not be listed, so callers can tell
+/// that apart from a root that genuinely holds no symlinks. Individual
+/// entries that cannot be inspected are skipped: an unresolvable target
+/// simply stays outside the allowed set and the read is rejected.
+fn scan_symlink_targets(root: &Path) -> Option<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut targets = Vec::new();
+    for entry in entries.flatten() {
+        let meta = match entry.path().symlink_metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            if let Ok(target) = entry.path().canonicalize() {
+                targets.push(target);
+            }
+        }
+    }
+    Some(targets)
 }
 
 impl SandboxedFs for SymlinkAwareSandbox {
@@ -256,11 +314,15 @@ impl SandboxedFs for SymlinkAwareSandbox {
             return read_file(&canonical);
         }
 
-        // Allow if under any registered symlink target
-        for target in &self.allowed_targets {
-            if canonical.starts_with(target) {
-                return read_file(&canonical);
-            }
+        // Allow if under any known symlink target
+        if self.is_allowed(&canonical) {
+            return read_file(&canonical);
+        }
+
+        // The symlink may have appeared after construction — refresh once
+        // before rejecting.
+        if self.rescan_and_check(&canonical) {
+            return read_file(&canonical);
         }
 
         Err(ReadError::Traversal {

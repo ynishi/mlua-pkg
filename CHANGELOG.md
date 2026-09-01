@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`FsResolver::new_symlink_aware` / `AssetResolver::new_symlink_aware`.**
+  `SymlinkAwareSandbox` already existed but was only reachable through
+  `with_sandbox` or `VendoredResolver`, so consumers rooting a resolver at a
+  directory of symlinks got the strict `FsSandbox` with no signal that an
+  alternative existed — and hit `ResolveError::PathTraversal` on every
+  `require` through a link.  The sandbox choice is now visible in the
+  constructor surface.
+
+### Changed
+
+- **`SymlinkAwareSandbox` refreshes its allowed set lazily.**  The set of
+  symlink targets was fixed at construction, so a package linked in
+  afterwards (a later `mlua-pkg install` in a long-running host) was rejected
+  until the sandbox was rebuilt.  The root is now rescanned once before a
+  read is rejected as a traversal; successful reads are unaffected, so the
+  `read_dir` cost stays on the would-be-error path.  A scan that fails
+  outright (unreadable root) leaves the cached targets intact, so a
+  transient I/O problem cannot silently demote known-good packages to
+  traversal rejections.
+
+### Documentation
+
+- README lists `SymlinkAwareSandbox` alongside `FsSandbox` / `CapSandbox`,
+  with guidance on picking a backend for linked package roots.
+- The `Some(Err)` resolver contract now states its consequence for sandbox
+  rejections: a boundary error shadows later resolvers for the names it
+  rejects (other names in the chain are unaffected).
+
 ## [0.6.0] - 2026-06-25
 
 ### Added

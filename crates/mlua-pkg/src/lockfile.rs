@@ -119,7 +119,7 @@ pub struct LockedPkg {
     /// Full 40-character commit SHA that pins this package.
     ///
     /// This is the canonical reproducibility anchor.  Short SHAs are **not**
-    /// accepted; the GitFetcher (ST3) always returns the full SHA.
+    /// accepted; the GitFetcher always returns the full SHA.
     pub sha: String,
 
     /// Resolved Lua `require` entry path within the vendored directory.

@@ -66,6 +66,16 @@
 //! If a module was "found but broken", having another Resolver return
 //! something different would be a source of bugs.
 //!
+//! One consequence is worth stating explicitly: a sandbox boundary
+//! rejection is also `Some(Err)`, so a single misconfigured root shadows
+//! later Resolvers **for the names it rejects**. If
+//! [`resolvers::FsResolver`] is rooted at a directory of symlinks and built
+//! with the default [`sandbox::FsSandbox`], every `require` through those
+//! symlinks fails with [`ResolveError::PathTraversal`] and never reaches a
+//! fallback [`resolvers::MemoryResolver`] behind it. Other names in the same
+//! chain are unaffected. The fix is to match the sandbox to the layout —
+//! [`resolvers::FsResolver::new_symlink_aware`] — not to reorder the chain.
+//!
 //! # Naming conventions
 //!
 //! | Name pattern | Example | Responsible Resolver |
@@ -189,7 +199,7 @@ use std::path::{Path, PathBuf};
 ///
 /// # Notes
 ///
-/// This function is used by the `install` CLI (ST5) to determine the symlink
+/// This function is used by the `install` CLI to determine the symlink
 /// target for each vendored package. [`resolvers::VendoredResolver`] itself does
 /// not call this function — the lockfile already carries the resolved `entry`
 /// field, and the CLI's symlink points `vendored/<name>` at
@@ -293,6 +303,11 @@ impl Default for LuaConvention {
 #[derive(Debug, thiserror::Error)]
 pub enum ResolveError {
     /// Path access outside the sandbox detected.
+    ///
+    /// Raised both by genuine escape attempts and by a legitimate symlink
+    /// whose target lies outside the root. For the latter, build the
+    /// resolver with [`resolvers::FsResolver::new_symlink_aware`] so the
+    /// symlink targets become part of the allowed set.
     #[error("path traversal blocked: {name}")]
     PathTraversal { name: String },
 

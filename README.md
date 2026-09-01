@@ -148,15 +148,37 @@ reg.add(FsResolver::new("./scripts")?);
 ## Sandbox
 
 All filesystem access goes through the `SandboxedFs` trait.
-Two implementations are provided:
+Three implementations are provided:
 
-| Implementation | TOCTOU safe | Dependency |
-|---------------|-------------|------------|
-| `FsSandbox` (default) | No | None |
-| `CapSandbox` | Yes | `cap-std` (opt-in) |
+| Implementation | Follows symlinks out of root | TOCTOU safe | Dependency |
+|---------------|------------------------------|-------------|------------|
+| `FsSandbox` (default) | No | No | None |
+| `SymlinkAwareSandbox` | Yes, for symlinks directly under root | No | None |
+| `CapSandbox` | No | Yes | `cap-std` (opt-in) |
 
 `FsSandbox` canonicalizes paths and blocks traversal, but has a TOCTOU gap
 between `canonicalize()` and `read_to_string()`.
+
+`SymlinkAwareSandbox` treats the targets of symlinks directly under the root
+as additional allowed roots. **Pick this whenever the root is populated by a
+linking package manager** — `mlua-pkg install` symlinks each dep under
+`<mlua-pkgs-dir>/vendored/<name>`, and `npm link` / `alc_pkg_link` behave the
+same way. With the default `FsSandbox`, every `require` through such a
+symlink fails with `ResolveError::PathTraversal`, and because that is a
+`Some(Err)` it does not fall through to later resolvers for those names.
+The allowed set is refreshed lazily, so packages linked in after the sandbox
+was constructed still resolve.
+
+```rust
+use mlua_pkg::resolvers::FsResolver;
+
+// root contains symlinks to external package sources
+let resolver = FsResolver::new_symlink_aware("./blocks")?;
+```
+
+`VendoredResolver` already uses this backend, so the
+`VendoredResolver::from_lockfile` path in [Use in Rust](#use-in-rust) needs no
+extra wiring.
 
 `CapSandbox` eliminates the TOCTOU gap via OS-level capability-based file
 access (`openat2` / `RESOLVE_BENEATH` on Linux, equivalent on other platforms).

@@ -3,7 +3,7 @@ use mlua_pkg::resolvers::*;
 #[cfg(feature = "sandbox-cap-std")]
 use mlua_pkg::sandbox::CapSandbox;
 use mlua_pkg::sandbox::{InitError, SymlinkAwareSandbox};
-use mlua_pkg::Registry;
+use mlua_pkg::{Registry, ResolveError, Resolver};
 use std::io::Write;
 
 // -- 1. preload: require in-memory Lua sources --
@@ -577,12 +577,12 @@ fn cap_sandbox_asset_json() {
 fn symlink_aware_sandbox_follows_root_symlinks() {
     let dir = tempfile::tempdir().unwrap();
 
-    // External package directory (simulates agent-profiles/packages/my_pkg)
+    // Package source that lives outside the sandbox root
     let external = dir.path().join("external_pkg");
     std::fs::create_dir_all(&external).unwrap();
     std::fs::write(external.join("init.lua"), "return { linked = true }").unwrap();
 
-    // Sandbox root (simulates ~/.algocline/packages/)
+    // Sandbox root, as a linking package manager would lay it out
     let sandbox = dir.path().join("sandbox");
     std::fs::create_dir_all(&sandbox).unwrap();
 
@@ -692,4 +692,183 @@ fn symlink_aware_sandbox_submodule_in_linked_pkg() {
         .eval()
         .unwrap();
     assert!(v);
+}
+
+// -- 25. new_symlink_aware: constructor resolves a linked package --
+
+#[cfg(unix)]
+#[test]
+fn new_symlink_aware_resolves_linked_package() {
+    let dir = tempfile::tempdir().unwrap();
+    let external = dir.path().join("external_pkg");
+    std::fs::create_dir_all(&external).unwrap();
+    std::fs::write(external.join("init.lua"), "return { linked = true }").unwrap();
+
+    let root = dir.path().join("vendored");
+    std::fs::create_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink(&external, root.join("my_pkg")).unwrap();
+
+    let lua = Lua::new();
+    let mut reg = Registry::new();
+    reg.add(FsResolver::new_symlink_aware(&root).unwrap());
+    reg.install(&lua).unwrap();
+
+    let v: bool = lua
+        .load(r#"return require("my_pkg").linked"#)
+        .eval()
+        .unwrap();
+    assert!(v);
+}
+
+// -- 26. default FsSandbox: traversal shadows the chain for that name only --
+
+#[cfg(unix)]
+#[test]
+fn traversal_shadows_only_the_rejected_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let external = dir.path().join("external_pkg");
+    std::fs::create_dir_all(&external).unwrap();
+    std::fs::write(external.join("init.lua"), "return { from = 'symlink' }").unwrap();
+
+    let root = dir.path().join("vendored");
+    std::fs::create_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink(&external, root.join("my_pkg")).unwrap();
+
+    let lua = Lua::new();
+
+    // The default constructor picks the strict FsSandbox, which classifies the
+    // symlink target as an escape: Some(Err), not None.
+    let strict = FsResolver::new(&root).unwrap();
+    let err = strict
+        .resolve(&lua, "my_pkg")
+        .expect("resolver must claim the name")
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<ResolveError>(),
+            Some(ResolveError::PathTraversal { .. })
+        ),
+        "expected PathTraversal, got {err:?}"
+    );
+
+    let mut reg = Registry::new();
+    reg.add(FsResolver::new(&root).unwrap());
+    reg.add(
+        MemoryResolver::new()
+            .add("my_pkg", "return { from = 'memory' }")
+            .add("other", "return { from = 'memory' }"),
+    );
+    reg.install(&lua).unwrap();
+
+    // The rejected name does not fall through to MemoryResolver.
+    let blocked: Result<String> = lua.load(r#"return require("my_pkg").from"#).eval();
+    assert!(blocked.is_err());
+
+    // Other names in the same chain are unaffected.
+    let ok: String = lua.load(r#"return require("other").from"#).eval().unwrap();
+    assert_eq!(ok, "memory");
+}
+
+// -- 27. SymlinkAwareSandbox: symlink created after construction is picked up --
+
+#[cfg(unix)]
+#[test]
+fn symlink_aware_sandbox_rescans_for_late_symlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("vendored");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // Sandbox built while the root is still empty.
+    let resolver = FsResolver::new_symlink_aware(&root).unwrap();
+
+    // Package linked in afterwards (a later `mlua-pkg install`).
+    let external = dir.path().join("late_pkg");
+    std::fs::create_dir_all(&external).unwrap();
+    std::fs::write(external.join("init.lua"), "return { late = true }").unwrap();
+    std::os::unix::fs::symlink(&external, root.join("late")).unwrap();
+
+    let lua = Lua::new();
+    let mut reg = Registry::new();
+    reg.add(resolver);
+    reg.install(&lua).unwrap();
+
+    let v: bool = lua.load(r#"return require("late").late"#).eval().unwrap();
+    assert!(v);
+}
+
+// -- 28. SymlinkAwareSandbox: rescan does not widen to unlinked outside paths --
+
+#[cfg(unix)]
+#[test]
+fn symlink_aware_sandbox_rescan_still_blocks_escapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let secret = dir.path().join("secret.lua");
+    std::fs::write(&secret, "return 'escaped'").unwrap();
+
+    let root = dir.path().join("vendored");
+    std::fs::create_dir_all(&root).unwrap();
+
+    // '/' as the separator so a `..` component survives into the candidate
+    // path. With the default '.' separator, "..secret" becomes "//secret",
+    // which `Path::join` treats as absolute — the read then misses at
+    // `canonicalize` and never reaches the boundary check at all.
+    let resolver = FsResolver::new_symlink_aware(&root)
+        .unwrap()
+        .with_module_separator('/');
+
+    // A legitimate link appears later; it must not authorize unrelated paths.
+    let external = dir.path().join("late_pkg");
+    std::fs::create_dir_all(&external).unwrap();
+    std::fs::write(external.join("init.lua"), "return { late = true }").unwrap();
+    std::os::unix::fs::symlink(&external, root.join("late")).unwrap();
+
+    let lua = Lua::new();
+
+    // Prime the rescan with the legitimate name.
+    let ok = resolver.resolve(&lua, "late").expect("late must resolve");
+    assert!(ok.is_ok(), "late failed: {:?}", ok.unwrap_err());
+
+    // The sibling secret exists and canonicalizes outside every allowed root,
+    // so it must be rejected as a traversal — not merely "not found".
+    let err = resolver
+        .resolve(&lua, "../secret")
+        .expect("resolver must claim the escaping name")
+        .unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<ResolveError>(),
+            Some(ResolveError::PathTraversal { .. })
+        ),
+        "expected PathTraversal, got {err:?}"
+    );
+}
+
+// -- 29. AssetResolver::new_symlink_aware: assets through a linked directory --
+
+#[cfg(unix)]
+#[test]
+fn asset_resolver_new_symlink_aware() {
+    let dir = tempfile::tempdir().unwrap();
+    let external = dir.path().join("external_assets");
+    std::fs::create_dir_all(&external).unwrap();
+    std::fs::write(external.join("config.json"), r#"{"key":"value"}"#).unwrap();
+
+    let root = dir.path().join("assets");
+    std::fs::create_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink(&external, root.join("linked")).unwrap();
+
+    let lua = Lua::new();
+    let mut reg = Registry::new();
+    reg.add(
+        AssetResolver::new_symlink_aware(&root)
+            .unwrap()
+            .parser("json", json_parser()),
+    );
+    reg.install(&lua).unwrap();
+
+    let v: String = lua
+        .load(r#"return require("linked/config.json").key"#)
+        .eval()
+        .unwrap();
+    assert_eq!(v, "value");
 }

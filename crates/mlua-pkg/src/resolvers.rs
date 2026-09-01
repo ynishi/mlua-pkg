@@ -196,8 +196,46 @@ pub struct FsResolver {
 
 impl FsResolver {
     /// Build an FsResolver backed by the real filesystem.
+    ///
+    /// Uses [`FsSandbox`], which rejects any path whose canonical form
+    /// escapes `root`. A symlink under `root` that points outside it is an
+    /// escape by that rule, so package layouts built from symlinks (including
+    /// the one `mlua-pkg install` writes by default) need
+    /// [`new_symlink_aware`](Self::new_symlink_aware) instead.
+    ///
+    /// | Root contains | Constructor |
+    /// |---------------|-------------|
+    /// | Only real files and directories | `new` |
+    /// | Symlinks to external package sources | [`new_symlink_aware`](Self::new_symlink_aware) |
+    /// | Untrusted input (TOCTOU matters) | [`with_sandbox`](Self::with_sandbox) + [`CapSandbox`](crate::sandbox::CapSandbox) |
     pub fn new(root: impl Into<PathBuf>) -> std::result::Result<Self, InitError> {
         let fs = FsSandbox::new(root)?;
+        Ok(Self::with_sandbox(fs))
+    }
+
+    /// Build an FsResolver that follows symlinks located directly under `root`.
+    ///
+    /// Uses [`SymlinkAwareSandbox`]: targets of those symlinks become
+    /// additional allowed roots, so `require("pkg")` resolves through
+    /// `root/pkg -> /elsewhere/pkg/init.lua` instead of failing with
+    /// [`ResolveError::PathTraversal`](crate::ResolveError::PathTraversal).
+    ///
+    /// Use this whenever the root is populated by a linking package manager
+    /// (`mlua-pkg install`, `npm link`, `alc_pkg_link`) or contains
+    /// development convenience symlinks.
+    ///
+    /// ```rust,no_run
+    /// use mlua_pkg::resolvers::FsResolver;
+    ///
+    /// let resolver = FsResolver::new_symlink_aware("./blocks")?;
+    /// # Ok::<(), mlua_pkg::sandbox::InitError>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InitError::RootNotFound`] if `root` does not exist.
+    pub fn new_symlink_aware(root: impl Into<PathBuf>) -> std::result::Result<Self, InitError> {
+        let fs = SymlinkAwareSandbox::new(root)?;
         Ok(Self::with_sandbox(fs))
     }
 
@@ -347,8 +385,24 @@ pub struct AssetResolver {
 
 impl AssetResolver {
     /// Build an AssetResolver backed by the real filesystem.
+    ///
+    /// Uses [`FsSandbox`]. See [`FsResolver::new`] for how the sandbox choice
+    /// interacts with symlinked roots.
     pub fn new(root: impl Into<PathBuf>) -> std::result::Result<Self, InitError> {
         let fs = FsSandbox::new(root)?;
+        Ok(Self::with_sandbox(fs))
+    }
+
+    /// Build an AssetResolver that follows symlinks located directly under `root`.
+    ///
+    /// Asset counterpart of [`FsResolver::new_symlink_aware`]; use it when
+    /// asset directories are linked in rather than copied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InitError::RootNotFound`] if `root` does not exist.
+    pub fn new_symlink_aware(root: impl Into<PathBuf>) -> std::result::Result<Self, InitError> {
+        let fs = SymlinkAwareSandbox::new(root)?;
         Ok(Self::with_sandbox(fs))
     }
 
@@ -515,7 +569,7 @@ impl Resolver for PrefixResolver {
 /// `vendored_root` directory (typically `.mlua-pkgs/vendored/`).
 ///
 /// Each package in that directory is expected to be a symlink (or real
-/// directory) created by the `mlua-pkg install` CLI (ST5).  For example,
+/// directory) created by the `mlua-pkg install` CLI.  For example,
 /// `require("foo")` resolves to `vendored/foo/init.lua`, and
 /// `require("foo.bar")` resolves to `vendored/foo/bar.lua`.
 ///
@@ -605,7 +659,7 @@ impl VendoredResolver {
             let entry = vendored_root.join(&pkg.name);
             if std::fs::symlink_metadata(&entry).is_err() {
                 // No tracing dependency — use eprintln as a lightweight warning.
-                // ST5 / real usage will add tracing; for now this is informational.
+                // A future revision may switch to `tracing`; for now this is informational.
                 eprintln!(
                     "mlua-pkg: vendored/{} not found — run `mlua-pkg install`",
                     pkg.name

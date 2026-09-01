@@ -67,8 +67,7 @@ pub enum PkgError {
     /// Two packages share the same `name` field within a lockfile.
     ///
     /// Package names must be unique within a lockfile.  Raised during
-    /// [`Lockfile::read`](crate::lockfile::Lockfile::read) and (in ST5) at
-    /// install time.
+    /// [`Lockfile::read`](crate::lockfile::Lockfile::read) and at install time.
     #[error("duplicate package name in lockfile: {name:?}")]
     SameNameConflict { name: String },
 
