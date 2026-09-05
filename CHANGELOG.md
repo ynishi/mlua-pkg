@@ -19,6 +19,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.9.0] - 2026-09-05
+
+### Added
+
+- **Transitive dependencies.**  `mlua-pkg install` now reads the
+  `mlua-pkg.toml` of every fetched package and installs its `[deps]` as well
+  (breadth-first), so consumers declare only what they use directly.  All
+  packages land flat under `vendored/<name>` and in the lockfile.
+- **`PkgError::DepConflict`.**  Raised when one package name is requested with
+  two different `Dep` specs (git URL / pin / `entry` / `target_dir`) during
+  resolution; the message names both requesters.  Identical specs reached
+  twice are installed once.  No version unification is attempted.
+
+### Changed
+
+- **Lockfile entries are sorted by name** and the install order is
+  deterministic (direct deps sorted, then discovered transitive deps), so
+  `mlua-pkg.lock` no longer depends on `HashMap` iteration order.
+- `install` reports `installed N package(s) (M transitive)` when any
+  transitive dep was pulled in.
+
 ## [0.8.0] - 2026-09-05
 
 ### Changed

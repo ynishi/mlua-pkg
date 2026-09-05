@@ -71,6 +71,19 @@ pub enum PkgError {
     #[error("duplicate package name in lockfile: {name:?}")]
     SameNameConflict { name: String },
 
+    /// The same package name is requested with two different `Dep` specs
+    /// (git URL / pin / entry / target_dir) during transitive resolution.
+    ///
+    /// `first` / `second` name who asked: `<manifest>` for a direct dep, else the
+    /// package whose `mlua-pkg.toml` declared it.  There is no version
+    /// unification; make both sides agree on one spec.
+    #[error("dependency conflict for {name:?}: requested by {first} and by {second} with different specs")]
+    DepConflict {
+        name: String,
+        first: String,
+        second: String,
+    },
+
     /// I/O error while reading or writing files (manifest, lockfile, cache).
     ///
     /// Automatically constructed from [`std::io::Error`] via `?`.

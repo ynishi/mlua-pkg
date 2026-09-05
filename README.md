@@ -236,6 +236,23 @@ release, writes `mlua-pkg.lock` with pinned SHAs, and either symlinks each
 dep under `<mlua-pkgs-dir>/vendored/<name>` (default) or copies the entry
 contents into the per-dep `target_dir` when one is set.
 
+#### Transitive dependencies
+
+A fetched package that ships its own `mlua-pkg.toml` has its `[deps]`
+installed too, breadth-first, so a consumer only declares what it uses
+directly.  Every package ends up flat under `vendored/<name>` and in the
+lockfile (sorted by name), which means one name maps to exactly one spec:
+
+- the same package reached twice with an **identical** `Dep` (git URL, pin,
+  `entry`, `target_dir`) is installed once;
+- reached with **different** specs, `install` stops with
+  `PkgError::DepConflict` naming both requesters (`<manifest>` for a direct
+  dep, otherwise the package that declared it).  There is no version
+  unification — make both sides agree.
+
+A transitive dep's `target_dir` is resolved relative to the *consumer's*
+manifest, like a direct one.
+
 #### Where the cache lives
 
 `mlua-pkg` picks the base directory in this order:

@@ -5,7 +5,7 @@
 //! the process working directory.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
 };
 
@@ -236,18 +236,48 @@ fn run_install(
     std::fs::create_dir_all(vendored_dir)?;
 
     let mut locked_pkgs: Vec<LockedPkg> = Vec::with_capacity(manifest.deps.len());
-    // Belt-and-suspenders same-name guard (HashMap keys are already unique for
-    // direct deps; this guard becomes meaningful when transitive deps are added).
-    let mut seen_names: HashSet<String> = HashSet::new();
 
-    for (name, dep) in &manifest.deps {
-        if !seen_names.insert(name.clone()) {
-            return Err(PkgError::SameNameConflict { name: name.clone() }.into());
+    // Worklist over (name, dep, requested_by). Direct deps seed it; every fetched
+    // package that ships its own `mlua-pkg.toml` appends its `[deps]` (transitive
+    // resolution, breadth-first). A name reached twice must carry an identical
+    // `Dep` (same git URL, pin, entry, target_dir) or the install fails with
+    // `PkgError::DepConflict` — there is no version unification.
+    let mut resolved: HashMap<String, (Dep, String)> = HashMap::new();
+    let mut queue: VecDeque<(String, Dep, String)> = VecDeque::new();
+    let mut direct: Vec<(&String, &Dep)> = manifest.deps.iter().collect();
+    direct.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, dep) in direct {
+        queue.push_back((name.clone(), dep.clone(), "<manifest>".to_string()));
+    }
+
+    while let Some((name, dep, requested_by)) = queue.pop_front() {
+        if let Some((prev, prev_by)) = resolved.get(&name) {
+            if *prev == dep {
+                continue; // same package reached via another path
+            }
+            return Err(PkgError::DepConflict {
+                name: name.clone(),
+                first: prev_by.clone(),
+                second: requested_by,
+            }
+            .into());
         }
+        resolved.insert(name.clone(), (dep.clone(), requested_by.clone()));
+        let name = &name;
+        let dep = &dep;
 
         let fetched = fetcher
             .fetch(dep)
-            .with_context(|| format!("fetching '{name}'"))?;
+            .with_context(|| format!("fetching '{name}' (requested by {requested_by})"))?;
+
+        // Transitive deps: enqueue the author's own `[deps]`, resolved later in order.
+        if let Some(author) = &fetched.manifest {
+            let mut sub: Vec<(&String, &Dep)> = author.deps.iter().collect();
+            sub.sort_by(|a, b| a.0.cmp(b.0));
+            for (sub_name, sub_dep) in sub {
+                queue.push_back((sub_name.clone(), sub_dep.clone(), name.clone()));
+            }
+        }
 
         // Author manifest version-assert: warn on tag mismatch, don't hard-error.
         if let Some(author) = &fetched.manifest {
@@ -309,13 +339,21 @@ fn run_install(
         });
     }
 
+    // Deterministic lockfile order regardless of HashMap iteration / discovery order.
+    locked_pkgs.sort_by(|a, b| a.name.cmp(&b.name));
+    let n = locked_pkgs.len();
     let lockfile = Lockfile {
         version: 1,
         pkg: locked_pkgs,
     };
     lockfile.write(lock_path)?;
 
-    println!("installed {} package(s)", manifest.deps.len());
+    let transitive = n.saturating_sub(manifest.deps.len());
+    if transitive > 0 {
+        println!("installed {n} package(s) ({transitive} transitive)");
+    } else {
+        println!("installed {n} package(s)");
+    }
     Ok(())
 }
 
@@ -858,6 +896,159 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, content).unwrap();
+    }
+
+    /// Initialise a git repository at `dir` with the given files committed;
+    /// return the commit SHA.
+    fn init_repo_with_files(dir: &Path, files: &[(&str, &str)]) -> String {
+        use git2::{Repository, Signature};
+
+        let repo = Repository::init(dir).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        let mut index = repo.index().unwrap();
+        for (rel, content) in files {
+            write_file(&dir.join(rel), content);
+            index.add_path(Path::new(rel)).unwrap();
+        }
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap()
+            .to_string()
+    }
+
+    // ── transitive deps ───────────────────────────────────────────────────────
+
+    #[test]
+    fn install_resolves_transitive_deps_from_author_manifest() {
+        // leaf: plain package
+        let leaf = TempDir::new().unwrap();
+        let leaf_sha = init_repo_with_files(leaf.path(), &[("main.lua", "return { leaf = true }\n")]);
+        let leaf_url = format!("file://{}", leaf.path().display());
+
+        // mid: depends on leaf via its own mlua-pkg.toml
+        let mid = TempDir::new().unwrap();
+        let mid_manifest = format!(
+            "[package]\nname = \"mid\"\nversion = \"0.1.0\"\n\n\
+             [deps]\nleaf = {{ git = \"{leaf_url}\", rev = \"{leaf_sha}\" }}\n"
+        );
+        let mid_sha = init_repo_with_files(
+            mid.path(),
+            &[("main.lua", "return require('leaf')\n"), ("mlua-pkg.toml", &mid_manifest)],
+        );
+        let mid_url = format!("file://{}", mid.path().display());
+
+        // root: only declares mid
+        let project = TempDir::new().unwrap();
+        let manifest_path = project.path().join("mlua-pkg.toml");
+        let cache_dir = project.path().join(".mlua-pkgs/cache");
+        let vendored_dir = project.path().join(".mlua-pkgs/vendored");
+        let lock_path = project.path().join("mlua-pkg.lock");
+        write_file(
+            &manifest_path,
+            &format!(
+                "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n\
+                 [deps]\nmid = {{ git = \"{mid_url}\", rev = \"{mid_sha}\" }}\n"
+            ),
+        );
+
+        run_install(&manifest_path, &cache_dir, &vendored_dir, &lock_path).unwrap();
+
+        let lf = Lockfile::read(&lock_path).unwrap();
+        let names: Vec<&str> = lf.pkg.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["leaf", "mid"], "both packages locked, sorted by name");
+        assert_eq!(lf.pkg[0].sha, leaf_sha);
+        assert_eq!(lf.pkg[1].sha, mid_sha);
+        assert!(vendored_dir.join("leaf").symlink_metadata().is_ok(), "leaf vendored");
+        assert!(vendored_dir.join("mid").symlink_metadata().is_ok(), "mid vendored");
+
+        // Idempotent.
+        run_install(&manifest_path, &cache_dir, &vendored_dir, &lock_path).unwrap();
+        assert_eq!(Lockfile::read(&lock_path).unwrap().pkg.len(), 2);
+    }
+
+    #[test]
+    fn install_same_dep_reached_twice_with_identical_spec_is_fine() {
+        let leaf = TempDir::new().unwrap();
+        let leaf_sha = init_repo_with_files(leaf.path(), &[("main.lua", "return {}\n")]);
+        let leaf_url = format!("file://{}", leaf.path().display());
+
+        let mid = TempDir::new().unwrap();
+        let mid_manifest = format!(
+            "[package]\nname = \"mid\"\nversion = \"0.1.0\"\n\n\
+             [deps]\nleaf = {{ git = \"{leaf_url}\", rev = \"{leaf_sha}\" }}\n"
+        );
+        let mid_sha = init_repo_with_files(
+            mid.path(),
+            &[("main.lua", "return {}\n"), ("mlua-pkg.toml", &mid_manifest)],
+        );
+        let mid_url = format!("file://{}", mid.path().display());
+
+        let project = TempDir::new().unwrap();
+        let manifest_path = project.path().join("mlua-pkg.toml");
+        let cache_dir = project.path().join(".mlua-pkgs/cache");
+        let vendored_dir = project.path().join(".mlua-pkgs/vendored");
+        let lock_path = project.path().join("mlua-pkg.lock");
+        // root declares leaf itself with the *same* spec mid uses.
+        write_file(
+            &manifest_path,
+            &format!(
+                "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n\
+                 [deps]\nmid = {{ git = \"{mid_url}\", rev = \"{mid_sha}\" }}\n\
+                 leaf = {{ git = \"{leaf_url}\", rev = \"{leaf_sha}\" }}\n"
+            ),
+        );
+
+        run_install(&manifest_path, &cache_dir, &vendored_dir, &lock_path).unwrap();
+        assert_eq!(Lockfile::read(&lock_path).unwrap().pkg.len(), 2);
+    }
+
+    #[test]
+    fn install_conflicting_transitive_spec_fails() {
+        let leaf = TempDir::new().unwrap();
+        let leaf_sha = init_repo_with_files(leaf.path(), &[("main.lua", "return {}\n")]);
+        let leaf_url = format!("file://{}", leaf.path().display());
+
+        // mid pins leaf by rev; root pins the same rev but with an `entry` override
+        // -> a different `Dep` spec, which is a conflict (no unification).
+        let mid = TempDir::new().unwrap();
+        let mid_manifest = format!(
+            "[package]\nname = \"mid\"\nversion = \"0.1.0\"\n\n\
+             [deps]\nleaf = {{ git = \"{leaf_url}\", rev = \"{leaf_sha}\" }}\n"
+        );
+        let mid_sha = init_repo_with_files(
+            mid.path(),
+            &[("main.lua", "return {}\n"), ("mlua-pkg.toml", &mid_manifest)],
+        );
+        let mid_url = format!("file://{}", mid.path().display());
+
+        let project = TempDir::new().unwrap();
+        let manifest_path = project.path().join("mlua-pkg.toml");
+        let cache_dir = project.path().join(".mlua-pkgs/cache");
+        let vendored_dir = project.path().join(".mlua-pkgs/vendored");
+        let lock_path = project.path().join("mlua-pkg.lock");
+        write_file(
+            &manifest_path,
+            &format!(
+                "[package]\nname = \"root\"\nversion = \"0.1.0\"\n\n\
+                 [deps]\nleaf = {{ git = \"{leaf_url}\", rev = \"{leaf_sha}\", entry = \".\" }}\n\
+                 mid = {{ git = \"{mid_url}\", rev = \"{mid_sha}\" }}\n"
+            ),
+        );
+
+        let err = run_install(&manifest_path, &cache_dir, &vendored_dir, &lock_path).unwrap_err();
+        let conflict = err
+            .downcast_ref::<PkgError>()
+            .map(|e| matches!(e, PkgError::DepConflict { name, .. } if name == "leaf"))
+            .unwrap_or(false);
+        assert!(conflict, "expected DepConflict for 'leaf', got: {err:#}");
+        assert!(!lock_path.exists(), "lockfile must not be written on conflict");
     }
 
     // ── install ───────────────────────────────────────────────────────────────
