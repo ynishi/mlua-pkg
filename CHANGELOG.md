@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+## [0.8.0] - 2026-09-05
+
+### Changed
+
+- **mlua 0.11 -> 0.12.**  `mlua` types appear in the public API (`Resolver`,
+  `Registry::install`, native module closures), so a consumer on mlua 0.12
+  could not link this crate alongside its own `mlua` (`mlua-sys` declares
+  `links`, which forbids two versions in one build).  No source changes were
+  needed; the full test suite passes unchanged on 0.12.
+- **MSRV 1.85 -> 1.88**, required by mlua 0.12.
+
 ## [0.7.0] - 2026-09-01
 
 ### Added
